@@ -740,7 +740,7 @@ def run_server(args):
 
     import taichi as ti
 
-    ti.init(arch=ti.metal, default_fp=ti.f32)
+    ti.init(default_fp=ti.f32)
 
     pmt_csv = args.pmt_csv
     if pmt_csv is None:

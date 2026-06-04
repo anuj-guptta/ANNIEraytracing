@@ -233,7 +233,7 @@ def extract_manifest_command(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     import taichi as ti
-    ti.init(arch=ti.metal, default_fp=ti.f32)
+    ti.init(default_fp=ti.f32)
 
     parser = build_parser()
     args = parser.parse_args(argv)
