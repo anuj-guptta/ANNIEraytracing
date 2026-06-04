@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Project-specific generated / test files
+hits.parquet
+detectors.yaml
+component_manifest.json
+
+# IDE
+.vscode/
+.idea/
