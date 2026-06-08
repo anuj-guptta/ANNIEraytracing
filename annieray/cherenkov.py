@@ -27,6 +27,8 @@ DEFAULT_WAVELENGTH = 350.0
 def generate_cherenkov_photons(
     muon_pos: tuple[float, float, float],
     muon_dir: tuple[float, float, float],
+    #Adding in array of wavelengths | Unused currently
+    # WaveLengths = np.linspace(10,1400, num = 100) #nm from UV to IR, low spacing for now to reduce computaional load
     n: int,
     cherenkov_angle: float = CHERENKOV_ANGLE,
     rng: np.random.Generator | None = None,
