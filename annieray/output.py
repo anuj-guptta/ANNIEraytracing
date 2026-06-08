@@ -10,7 +10,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-# 15-column hit schema: 13 kernel cols + arrival_time + wavelength
+# 15-column hit schema
+#
+# Columns 0-12 come from the GPU kernel (see tracer.py for column indices).
+# Columns 13-14 are added by trace_cherenkov() in tracer.py:
+#   13 = arrival_time (ns) — photon path length / (C / n_water)
+#   14 = wavelength (nm)   — currently a single value; per-photon support
+#                            can be added by returning a wavelength array
+#                            from generate_cherenkov_photons() in cherenkov.py
 HIT_SCHEMA = pa.schema([
     ("hit_flag", pa.int32()),
     ("t", pa.float32()),

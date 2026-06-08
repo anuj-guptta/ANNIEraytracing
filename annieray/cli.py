@@ -83,7 +83,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _generate_uniform(geometry: Geometry, n: int, rng: np.random.Generator) -> tuple:
-    """Generate random photons uniformly inside the tank volume."""
+    """Generate random photons uniformly inside the tank volume.
+
+    Positions are rejection-sampled inside a cylinder 90 % of the tank
+    radius.  Directions are isotropic (uniform on the sphere).
+
+    This is useful for flat efficiency scans — each photon has equal
+    probability of hitting any detector regardless of emission model.
+
+    To add a new emission model, create a function with the same
+    signature (geometry, n, rng) → (origins, directions) and wire
+    it into run_command() as a new --mode branch.
+
+    Returns (origins, directions) arrays, each (N, 3) float32.
+    """
     r_tank = geometry.tank_radius * 0.9
     z_min = geometry.tank_z_min + 100.0
     z_max = geometry.tank_z_max - 100.0
@@ -126,7 +139,14 @@ def _generate_cherenkov(
     muon_dir: tuple = (0.0, 0.0, -1.0),
     cherenkov_angle: float = 0.73,
 ) -> tuple:
-    """Generate Cherenkov cone from a muon track (delegates to cherenkov module)."""
+    """Generate Cherenkov cone from a muon track (delegates to cherenkov module).
+
+    This is a thin wrapper that calls generate_cherenkov_photons() in
+    cherenkov.py.  The student modifying the emission model should work
+    in cherenkov.py directly; this function just passes through.
+
+    Returns (origins, directions) arrays, each (N, 3) float32.
+    """
     from annieray.cherenkov import generate_cherenkov_photons
 
     return generate_cherenkov_photons(

@@ -31,15 +31,33 @@ CORRECTION = 0.965
 
 @dataclass
 class LAPPDHousing:
-    """Oriented-box housing with internal photocathode."""
+    """Oriented-box housing with internal photocathode.
 
-    centre: tuple[float, float, float]          # box centre (mm), after 0.93 correction
+    The housing is a rectangular box (330×430×60 mm) whose axes are
+    defined relative to the tank wall:
+      - local X: tangential along the tank circumference
+      - local Y: vertical (parallel to +Z in the structure frame)
+      - local Z: radially inward (front face normal)
+
+    The photocathode (PC) is a smaller square inside the box, offset
+    in Y by -45 mm and in Z by +3.5 mm (toward the front face).
+
+    Attributes:
+        centre:    Box centre (mm) in structure frame, after 0.965 radial correction.
+        axes:      Orthonormal right-handed frame: (local_X, local_Y, local_Z).
+        half:      Half-extents (mm) along each local axis.
+        pc_centre: World-frame photocathode centre (mm).
+        pc_normal: World-frame photocathode normal (= +local_Z, inward).
+        pc_half:   Photocathode half-side lengths (mm).
+    """
+
+    centre: tuple[float, float, float]          # box centre (mm), after 0.965 correction
     axes: tuple[                                # orthonormal right-handed axes
-        tuple[float, float, float],             # local X (tangential)
+        tuple[float, float, float],             # local X (tangential along tank wall)
         tuple[float, float, float],             # local Y (vertical = +Z in structure frame)
         tuple[float, float, float],             # local Z (radially inward = front face)
     ]
-    half: tuple[float, float, float] = HOUSING_HALF  # half-extents
+    half: tuple[float, float, float] = HOUSING_HALF  # (HX, HY, HZ) half-extents in mm
 
     # Pre-computed world-frame photocathode
     pc_centre: tuple[float, float, float] | None = None
@@ -70,18 +88,25 @@ def build_housing(
     cx, cy, cz = cad_centre
     nx, ny, nz = cad_normal
 
-    # Apply 0.93 radial correction in XY only (Z unchanged)
+    # ---- Apply radial correction ----
+    # The STEP CAD candidate positions are on the CAD cylinder, but the
+    # housing box is offset inward so its front face aligns with the
+    # physical support column (r ≈ 1304 mm).  CORRECTION = 0.965 scales
+    # the XY position to move the box centre inward by ≈ half the box
+    # thickness (30 mm).  Only XY is scaled; Z (vertical) is unchanged.
     hx = cx * CORRECTION
     hy = cy * CORRECTION
     hz = cz
 
-    # Local axes (right-handed)
-    local_z = (nx, ny, nz)  # front face normal = radial inward
+    # ---- Build local axes (right-handed orthonormal) ----
+    # local_Z: points radially inward (front face normal)
+    local_z = (nx, ny, nz)
 
-    # local_y follows z_axis (vertical)
+    # local_Y: vertical, parallel to the tank Z-axis
     local_y = z_axis
 
-    # local_x = cross(local_y, local_z), then re-orthogonalise
+    # local_X = cross(local_Y, local_Z), then re-orthogonalise
+    # This gives the tangential direction around the tank circumference.
     lx = (
         local_y[1] * local_z[2] - local_y[2] * local_z[1],
         local_y[2] * local_z[0] - local_y[0] * local_z[2],
@@ -100,7 +125,12 @@ def build_housing(
         local_z[0] * local_x[1] - local_z[1] * local_x[0],
     )
 
-    # Photocathode world position
+    # ---- Photocathode world position ----
+    # PC_LOCAL = (0, -45, 3.5) mm in the housing local frame:
+    #   X: centred (0)
+    #   Y: offset -45 mm (shifted downward in the housing)
+    #   Z: offset +3.5 mm (shifted toward front face, inside the air gap)
+    # Transform to world frame using the local-axis basis vectors.
     plx, ply, plz = PC_LOCAL
     pc_world = (
         hx + plx * local_x[0] + ply * local_y[0] + plz * local_z[0],

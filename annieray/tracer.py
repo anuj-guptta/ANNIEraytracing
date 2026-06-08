@@ -12,58 +12,82 @@ from annieray import pmt_loader
 from annieray.step_parser import LAPPD_HALF_SIZE
 
 
-# ---- Component IDs ----
-CID_NO_HIT = 0
-CID_INNER_STRUCTURE = 1
-CID_PMT = 2
-CID_LAPPD = 3
-CID_TANK_WALL = 4
+# ---- Component IDs (written to hits[:, 8] = HCID) ----
+CID_NO_HIT = 0           # photon escaped or was absorbed
+CID_INNER_STRUCTURE = 1  # hit the GDPM structure mesh (steel, acrylic, etc.)
+CID_PMT = 2              # hit a PMT photocathode sphere
+CID_LAPPD = 3            # hit a LAPPD photocathode rectangle
+CID_TANK_WALL = 4        # hit the invisible outer tank cylinder
 
-# ---- Detector system codes (written to hits[:, 10]) ----
-DET_SYS_NONE = -1
-DET_SYS_PMT = 0
-DET_SYS_LAPPD_DEFAULT = 1
-DET_SYS_LAPPD_ANNIE = 2
+# ---- Detector system codes (written to hits[:, 10] = HDS) ----
+DET_SYS_NONE = -1          # not a detector hit (structure, tank, or none)
+DET_SYS_PMT = 0            # hit recorded against a PMT detector
+DET_SYS_LAPPD_DEFAULT = 1  # hit recorded against a default bare-rectangle LAPPD
+DET_SYS_LAPPD_ANNIE = 2    # hit recorded against the ANNIE housed LAPPD
 
-# ---- Index constants for the expanded 13-column hit array ----
-HI = 0   # hit_flag
-HT = 1   # t (mm)
-HX = 2   # hit x
-HY = 3   # hit y
-HZ = 4   # hit z
-HNX = 5  # hit normal x
+# ---- Column indices for the 13-column hit array produced by the kernel ----
+# These names are used throughout the code to avoid magic-number indexing.
+HI = 0   # hit_flag      (1 = hit, 0 = miss)
+HT = 1   # t             (path length from origin to hit, mm)
+HX = 2   # hit x         (detector-frame X coordinate, mm)
+HY = 3   # hit y         (detector-frame Y coordinate, mm)
+HZ = 4   # hit z         (detector-frame Z coordinate, mm)
+HNX = 5  # hit normal x  (outward-facing normal at hit point)
 HNY = 6  # hit normal y
 HNZ = 7  # hit normal z
-HCID = 8 # component_id
-HDI = 9  # detector_index
-HDS = 10 # detector_system
-HLU = 11 # local_u
-HLV = 12 # local_v
+HCID = 8 # component_id  (which geometry element was hit: 1-4 above)
+HDI = 9  # detector_index(which detector in the registry; -1 = not a detector)
+HDS = 10 # detector_system(which detector type: 0 = PMT, 1 = LAPPD default, 2 = LAPPD annie)
+HLU = 11 # local_u      (PMT: polar angle θ from direction in rad; LAPPD: position along strips in mm)
+HLV = 12 # local_v      (PMT: azimuthal angle φ in rad; LAPPD: position across strips in mm)
 
 N_HIT_COLS = 13
 
 # Speed of light in vacuum (mm/ns)
 C_MM_NS = 299.792458
 
-# Default refractive index of water
+# Default refractive index of water at ~350 nm
+# Used to convert photon path length to arrival time: t_arrival = t / (C/n)
 N_WATER_DEFAULT = 1.34
 
 
 @dataclass
 class Geometry:
-    mesh_vertices: np.ndarray
-    mesh_triangles: np.ndarray
-    pmt_centers: np.ndarray
-    pmt_radii: np.ndarray
-    pmt_directions: np.ndarray
-    lappd_data: np.ndarray
-    lappd_strip_axes: np.ndarray
-    tank_radius: float
-    tank_z_min: float
-    tank_z_max: float
-    lappd_housing_data: np.ndarray = field(default_factory=lambda: np.empty((0, 16), dtype=np.float32))
-    annie_lappd_data: np.ndarray = field(default_factory=lambda: np.empty((0, 7), dtype=np.float32))
-    detectors: list = field(default_factory=list)
+    """Aggregate geometry passed to the Taichi kernel.
+
+    Fields prefixed with mesh_/pmt_/lappd_ are GPU arrays consumed directly
+    by trace_kernel().  The detectors list is the human-readable registry
+    that maps detector_index → detector ID, type, position, etc.
+    """
+    # ---- GDML structure mesh ----
+    mesh_vertices: np.ndarray   # (N, 3) float32 — triangle vertex XYZ (mm)
+    mesh_triangles: np.ndarray  # (M, 3) int32   — vertex-index triplets
+
+    # ---- PMT spheres ----
+    pmt_centers: np.ndarray     # (P, 3) float32 — sphere centre in structure frame (mm)
+    pmt_radii: np.ndarray       # (P,)   float32 — radius per PMT (mm)
+    pmt_directions: np.ndarray  # (P, 3) float32 — inward-pointing unit normal
+
+    # ---- Default LAPPD rectangles (bare photocathode) ----
+    lappd_data: np.ndarray      # (L, 7) float32 — [cx,cy,cz, nx,ny,nz, half_size]
+    lappd_strip_axes: np.ndarray  # (L, 3) float32 — strip-axis unit vector per LAPPD
+
+    # ---- Tank cylinder bounds (used for _ray_tank_intersect) ----
+    tank_radius: float  # mm
+    tank_z_min: float   # mm
+    tank_z_max: float   # mm
+
+    # ---- ANNIE LAPPD housing model (when --lappd-model=annie) ----
+    lappd_housing_data: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 16), dtype=np.float32)
+    )  # (H, 16) float32 — see housing_to_arrays() for layout
+
+    annie_lappd_data: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 7), dtype=np.float32)
+    )  # (H, 7) float32 — photocathode rect [cx,cy,cz, nx,ny,nz, half]
+
+    # ---- Detector registry (not used by the kernel) ----
+    detectors: list = field(default_factory=list)  # list[DetectorInfo]
 
 
 def build_geometry(
@@ -76,9 +100,22 @@ def build_geometry(
     z_offset: float = 0.0,
     lappd_model: str = "default",
 ) -> Geometry:
+    """Build a Geometry from a GDML file and optional PMT/STEP data sources.
+
+    Stages:
+      1. Parse the GDML structure mesh (always required).
+      2. Load PMT positions from CSV, or from STEP manifest as fallback.
+      3. Load the STEP manifest (if available) for LAPPD and tank info.
+      4. Build default LAPPD rectangles from manifest candidate positions.
+      5. Optionally build the ANNIE LAPPD housing model.
+      6. Build the detector registry (stable ID → DetectorInfo mapping).
+    """
+    # ---- Stage 1: parse the GDML structure mesh ----
     verts, tris = gdml_parser.parse_gdml(gdml_path)
 
-    # Load PMTs from CSV (preferred) or manifest/STEP
+    # ---- Stage 2: load PMT positions ----
+    # PMTs can come from: (a) Scan CSV file, (b) STEP manifest JSON, (c) STEP raw.
+    # The CSV is preferred because it has per-PMT radii and type names.
     pmt_directions = np.zeros((0, 3), dtype=np.float32)
     if pmt_csv_path and pmt_csv_path.exists():
         pmt_data = pmt_loader.load_pmts(pmt_csv_path, z_offset=z_offset)
@@ -97,14 +134,16 @@ def build_geometry(
         pmt_centers = np.zeros((0, 3), dtype=np.float32)
         pmt_radii = np.zeros(0, dtype=np.float32)
 
-    # Load manifest once (shared by default LAPPDs, housing model, and tank bounds)
+    # ---- Stage 3: load the STEP manifest (LAPPD candidates and tank bounds) ----
     manifest = None
     if manifest_path and manifest_path.exists():
         manifest = step_parser.ComponentManifest.from_json(manifest_path)
     elif step_path:
         manifest = step_parser.parse_step(step_path)
 
-    # Tank bounds from manifest or defaults (needed early for Z-centre)
+    # ---- Tank bounds (from manifest or hard-coded defaults) ----
+    # Used for the infinite-cylinder tank-wall intersection and for computing
+    # the Z-centre when placing the ANNIE housing on the octagon.
     if manifest and manifest.tank_bbox:
         tank_radius = max(
             manifest.tank_bbox.xmax - manifest.tank_bbox.xmin,
@@ -130,7 +169,10 @@ def build_geometry(
             lappd_sources = [tuple(manifest.lappd_candidates[i].center) for i in DEFAULT_LAPPD_INDICES
                             if i < len(manifest.lappd_candidates)]
 
-    # Default LAPPD rectangles (all sources except the one replaced by ANNIE housing)
+    # ---- Stage 4: build default LAPPD rectangles ----
+    # Each LAPPD is a square photocathode rectangle at a candidate position
+    # from the STEP manifest.  The ANNIE model replaces one of these with
+    # the full housing (Stage 5).
     lappd_data = np.zeros((0, 7), dtype=np.float32)
     lappd_strip_axes = np.zeros((0, 3), dtype=np.float32)
     housing_source: tuple[float, float, float] | None = None
@@ -170,7 +212,10 @@ def build_geometry(
         lappd_data = np.array(lappd_list, dtype=np.float32) if lappd_list else np.zeros((0, 7), dtype=np.float32)
         lappd_strip_axes = np.array(strip_list, dtype=np.float32) if strip_list else np.zeros((0, 3), dtype=np.float32)
 
-    # LAPPD housing model (ANNIE model replaces one default LAPPD)
+    # ---- Stage 5: ANNIE LAPPD housing model ----
+    # When --lappd-model=annie, replaces the default rectangle closest to
+    # the tank mid-plane with a 5-sided waterproof box (Kandemir design)
+    # containing an off-centre photocathode.
     lappd_housing_data = np.empty((0, 16), dtype=np.float32)
     annie_lappd_data = np.empty((0, 7), dtype=np.float32)
     if lappd_model == "annie" and housing_source is not None:
@@ -183,7 +228,10 @@ def build_geometry(
         housing = build_housing((cx, cy, cz), normal)
         lappd_housing_data, annie_lappd_data = housing_to_arrays(housing)
 
-    # Build detector registry
+    # ---- Stage 6: build detector registry ----
+    # Creates a list of DetectorInfo objects with stable IDs (WCSim TubeIDs
+    # 332–463 for PMTs, 1000+ for LAPPDs, 2000+ for ANNIE LAPPD) so that
+    # hit records can be mapped back to hardware regardless of array indexing.
     from annieray.detectors import build_detector_registry
 
     pmt_types_list: list[str] = []
@@ -284,13 +332,21 @@ def _ray_triangle_intersect(
 
 @ti.func
 def _ray_sphere_intersect(ox, oy, oz, dx, dy, dz, scx, scy, scz, radius):
+    """Ray–sphere intersection.  Returns (hit, t_hit, nx, ny, nz).
+
+    For a ray along direction (dx,dy,dz) from origin (ox,oy,oz),
+    solves the quadratic |O + t*D - C|² = r².
+    t0 = first intersection (entry into sphere)
+    t1 = second intersection (exit from sphere)
+    If the origin is inside the sphere, t0 < 0 and we use t1 instead.
+    """
     hit = 0
     t_hit = 0.0
     nx = 0.0
     ny = 0.0
     nz = 0.0
 
-    cx = ox - scx
+    cx = ox - scx  # vector from sphere centre to ray origin
     cy = oy - scy
     cz = oz - scz
 
@@ -301,12 +357,12 @@ def _ray_sphere_intersect(ox, oy, oz, dx, dy, dz, scx, scy, scz, radius):
     disc = b * b - 4.0 * a * c
     if disc >= 0.0:
         sqrt_disc = ti.sqrt(disc)
-        t0 = (-b - sqrt_disc) / (2.0 * a)
-        t1 = (-b + sqrt_disc) / (2.0 * a)
+        t0 = (-b - sqrt_disc) / (2.0 * a)  # first intersection (entry)
+        t1 = (-b + sqrt_disc) / (2.0 * a)  # second intersection (exit)
 
         t_hit = t0
         if t_hit < 1e-6:
-            t_hit = t1
+            t_hit = t1  # origin inside sphere → use exit point
         if t_hit >= 1e-6:
             hx = ox + dx * t_hit - scx
             hy = oy + dy * t_hit - scy
@@ -594,6 +650,22 @@ def _lappd_local_coords(hx, hy, hz, lcx, lcy, lcz, sx, sy, sz, nx, ny, nz):
 
 
 # ---- GPU kernel ----
+#
+# Each GPU thread processes one photon independently.  Every thread tests
+# its photon against ALL geometry elements (triangles, spheres, rectangles,
+# boxes, tank cylinder) and keeps the nearest intersection (smallest t).
+#
+# The kernel writes a fixed-width 13-column row per photon:
+#   [hit_flag, t, x,y,z, nx,ny,nz, component_id, detector_index,
+#    detector_system, local_u, local_v]
+#
+# Tracing order (later = higher priority for same t):
+#   1. Structure mesh (triangles)            → component_id = 1
+#   2. PMT spheres                           → component_id = 2
+#   3. Default LAPPD rectangles              → component_id = 3
+#   4. ANNIE housing box (absorbs side/back) → kills photon (component_id = 0)
+#   5. ANNIE LAPPD photocathode rectangle    → component_id = 3
+#   6. Tank wall (infinite cylinder)         → component_id = 4
 
 
 @ti.kernel
@@ -892,6 +964,16 @@ def trace_cherenkov(
 ) -> np.ndarray:
     """Trace Cherenkov photons from a muon track.
 
+    Workflow:
+      1. Call generate_cherenkov_photons() to get (origins, directions).
+      2. Run the GPU kernel via trace_rays() → (N, 13) hit array.
+      3. Expand to (N, 15) by appending arrival_time and wavelength.
+
+    The expansion is the place to add per-photon wavelength and timing.
+    Currently wavelength_nm is a single scalar; for a per-photon spectrum,
+    generate_cherenkov_photons() should return a wavelength array and this
+    function should stamp it into full[:, 14] per-photon instead.
+
     Returns (N, 15) hit array with columns:
         0: hit_flag, 1: t (mm), 2-4: x,y,z, 5-7: nx,ny,nz,
         8: component_id, 9: detector_index, 10: detector_system,
@@ -907,19 +989,31 @@ def trace_cherenkov(
     )
     hits = trace_rays(origins, directions, geometry)
 
-    # Expand to 15 columns and fill arrival_time + wavelength
+    # ---- Expand from 13 to 15 columns ----
+    # Kernel output: columns 0-12 (hit_flag through local_v).
+    # We add columns 13 (arrival_time in ns) and 14 (wavelength in nm).
     n = hits.shape[0]
     full = np.zeros((n, N_HIT_COLS + 2), dtype=np.float32)
     full[:, :N_HIT_COLS] = hits
 
-    # Fill wavelength (same for all photons for now)
-    full[:, N_HIT_COLS + 1] = wavelength_nm  # col 14
+    # Col 14: wavelength
+    # Currently a single value for all photons.  To support per-photon
+    # wavelength sampling, replace this line with per-photon assignment
+    # using a wavelength array from generate_cherenkov_photons().
+    full[:, N_HIT_COLS + 1] = wavelength_nm
 
-    # Arrival time = photon path / (c / n_water)
-    # Currently all photons start at vertex, so arrival_time = t / (C/n)
+    # Col 13: arrival_time = photon path length / speed_of_light_in_water
+    #   t = ray path length from origin to hit (mm)
+    #   C = 299.79 mm/ns (vacuum)
+    #   n = refractive index of water
+    #   arrival_time = t / (C / n)
+    #
+    # NOTE: This assumes all photons start at the same vertex.  Once muon
+    # propagation is added, the per-photon emission time along the track
+    # must be added to this calculation.
     c_in_water = C_MM_NS / n_water
     hit_mask = hits[:, HI] > 0.5
     if hit_mask.any():
-        full[hit_mask, N_HIT_COLS] = hits[hit_mask, HT] / c_in_water  # col 13
+        full[hit_mask, N_HIT_COLS] = hits[hit_mask, HT] / c_in_water
 
     return full

@@ -16,19 +16,33 @@ LAPPD_ID_OFFSET_ANNIE = 2000
 
 @dataclass
 class DetectorInfo:
-    id: int                                    # stable unique ID (TubeID 332-463 for PMTs,
-                                               #   1000+ for default LAPPDs, 2000+ for ANNIE LAPPDs)
-    system: str                                # "pmt" | "lappd_default" | "lappd_annie"
-    label: str                                 # human-readable, e.g. "PMT_332"
-    index: int                                 # position in geometry arrays (-1 if not built)
-    position: tuple[float, float, float]       # centre in structure frame (mm)
-    direction: tuple[float, float, float]      # inward-pointing unit normal
+    """Stable record for one photosensor in the ANNIE detector.
 
-    panel: int = -1                            # 0-9 for PMTs
-    pmt_type: str = ""                         # LUX, ETEL, Hamamatsu, Watchboy, Watchman
-    radius: float = 0.0                        # PMT radius (mm)
-    half_size: float = 0.0                     # LAPPD photocathode half-side (mm)
-    strip_axis: tuple[float, float, float] = (0.0, 0.0, 1.0)  # LAPPD strip direction
+    Each detector has a unique ID that persists across runs, independent
+    of array indices in the GPU kernel.  This lets analysis code match
+    hits to hardware without relying on geometry construction order.
+
+    ID ranges:
+        PMT:           332–463 (WCSim TubeIDs)
+        Default LAPPD: 1000+  (one index per rectangle)
+        ANNIE LAPPD:   2000+  (one index per housed LAPPD)
+    """
+
+    id: int                                  # stable unique ID
+    system: str                              # "pmt" | "lappd_default" | "lappd_annie"
+    label: str                               # human-readable name, e.g. "PMT_332"
+    index: int                               # position in geometry arrays (-1 if loaded from YAML)
+    position: tuple[float, float, float]     # centre in structure frame (mm)
+    direction: tuple[float, float, float]    # inward-pointing unit normal
+
+    # PMT-specific fields
+    panel: int = -1                          # panel number 0-9 (0=bottom LUX, 9=top ETEL)
+    pmt_type: str = ""                       # LUX, ETEL, Hamamatsu, Watchboy, Watchman
+    radius: float = 0.0                      # PMT sphere radius (mm)
+
+    # LAPPD-specific fields
+    half_size: float = 0.0                   # photocathode half-side length (mm)
+    strip_axis: tuple[float, float, float] = (0.0, 0.0, 1.0)  # LAPPD strip direction (unit vector)
 
 
 def build_detector_registry(
