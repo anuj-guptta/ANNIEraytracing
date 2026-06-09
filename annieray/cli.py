@@ -130,12 +130,12 @@ def _generate_uniform(geometry: Geometry, n: int, rng: np.random.Generator) -> t
 
     return origins, directions
 
-
+#Call generate_cherenkov for each muon, make a seperate function for multiple muon generation
 def _generate_cherenkov(
     geometry: Geometry,
     n: int,
     rng: np.random.Generator,
-    muon_pos: tuple = (0.0, 0.0, 2000.0),
+    muon_pos: tuple = (0.0, 0.0, 2000.0), #Tank coordinate system (cartesian based on the cylinder) where z is height
     muon_dir: tuple = (0.0, 0.0, -1.0),
     cherenkov_angle: float = 0.73,
 ) -> tuple:
