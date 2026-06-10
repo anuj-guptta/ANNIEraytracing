@@ -147,14 +147,18 @@ class VizHandler(BaseHTTPRequestHandler):
         )
         elapsed = time.time() - t0
 
-        pmt_hits = hits[:, 0].astype(int).tolist()
-        struct_mask = hits[:, 8] == 1.0
-        struct_positions = hits[struct_mask, 2:5].tolist()
         total_hits = int(hits[:, 0].sum())
 
+        # Return positions by component type — these are drawn as dots
+        comp = hits[:, 8]
+        pmt_positions = hits[comp == 2.0, 2:5].tolist()
+        struct_positions = hits[comp == 1.0, 2:5].tolist()
+        tank_positions  = hits[comp == 4.0, 2:5].tolist()
+
         self._send_json({
-            "pmt_hits": pmt_hits,
-            "struct_hits": struct_positions,
+            "pmt_positions": pmt_positions,
+            "struct_positions": struct_positions,
+            "tank_positions": tank_positions,
             "total_hits": total_hits,
             "total_photons": n,
             "time_ms": round(elapsed * 1000, 1),
@@ -233,6 +237,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <label style="margin-top:6px;"><input type="checkbox" id="structGrey"> Grey Structure</label>
   <label style="margin-top:2px;"><input type="checkbox" id="pmtGrey"> Grey PMTs</label>
   <label style="margin-top:2px;"><input type="checkbox" id="showCone" checked> Show Cone Guide</label>
+  <button id="traceBtn" style="margin-top:8px;">Trace Cherenkov Photons</button>
+  <div id="traceResult" style="margin-top:6px;font-size:12px;line-height:1.5;"></div>
   <hr style="margin:8px 0;border:none;border-top:1px solid rgba(0,0,0,0.15);">
   <h3 style="margin-top:6px;">View</h3>
   <label>Azimuth <span id="viewAzVal">36</span>
@@ -267,6 +273,8 @@ let spotLight = null;
 let spotTarget = null;
 let housingData = null;
 let boxMesh = null;
+let tracePoints = null;   // group of dot meshes for traced photon hits
+let traceResultEl = null;
 
 // ---- DOM refs ----
 const statusEl = document.getElementById('status');
@@ -443,6 +451,67 @@ function updateScene() {
     updateMuonAndLight({ x: mx, y: my, z: mz }, { x: dx, y: dy, z: dz });
 }
 
+// ---- Trace Cherenkov photons ----
+async function doTrace() {
+    const mx = document.getElementById('mx').value;
+    const my = document.getElementById('my').value;
+    const mz = document.getElementById('mz').value;
+    const theta = parseFloat(thetaSlider.value);
+    const phi = parseFloat(phiSlider.value);
+    const dx = Math.sin(theta) * Math.cos(phi);
+    const dy = Math.sin(theta) * Math.sin(phi);
+    const dz = Math.cos(theta);
+    const n = 10000;
+
+    const btn = document.getElementById('traceBtn');
+    btn.disabled = true;
+    btn.textContent = 'Tracing…';
+    traceResultEl = document.getElementById('traceResult');
+
+    try {
+        const url = `/api/trace?mx=${mx}&my=${my}&mz=${mz}&dx=${dx.toFixed(6)}&dy=${dy.toFixed(6)}&dz=${dz.toFixed(6)}&n=${n}`;
+        const resp = await fetch(url);
+        const data = await resp.json();
+
+        // Remove previous trace dots
+        if (tracePoints) scene.remove(tracePoints);
+
+        const dotGeo = new THREE.SphereGeometry(8, 6, 6);
+        const pmtMat = new THREE.MeshBasicMaterial({ color: 0x44dd88 });
+        const structMat = new THREE.MeshBasicMaterial({ color: 0xff8844 });
+        const tankMat = new THREE.MeshBasicMaterial({ color: 0x4488ff });
+
+        tracePoints = new THREE.Group();
+        for (const p of data.pmt_positions) {
+            const m = new THREE.Mesh(dotGeo, pmtMat);
+            m.position.set(p[0], p[1], p[2]);
+            tracePoints.add(m);
+        }
+        for (const p of data.struct_positions) {
+            const m = new THREE.Mesh(dotGeo, structMat);
+            m.position.set(p[0], p[1], p[2]);
+            tracePoints.add(m);
+        }
+        for (const p of data.tank_positions) {
+            const m = new THREE.Mesh(dotGeo, tankMat);
+            m.position.set(p[0], p[1], p[2]);
+            tracePoints.add(m);
+        }
+        scene.add(tracePoints);
+
+        traceResultEl.innerHTML = `<b>${data.total_hits}</b>/<b>${data.total_photons}</b> hits `
+            + `(PMT <b>${data.pmt_positions.length}</b>, `
+            + `struct <b>${data.struct_positions.length}</b>, `
+            + `tank <b>${data.tank_positions.length}</b>) `
+            + `in ${data.time_ms} ms`;
+    } catch (e) {
+        traceResultEl.textContent = 'Trace failed: ' + e.message;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Trace Cherenkov Photons';
+    }
+}
+
 // ---- Events ----
 thetaSlider.addEventListener('input', updateScene);
 phiSlider.addEventListener('input', updateScene);
@@ -452,6 +521,7 @@ document.getElementById('mz').addEventListener('change', updateScene);
 document.getElementById('showCone').addEventListener('change', () => {
     if (coneVisual) coneVisual.visible = document.getElementById('showCone').checked;
 });
+document.getElementById('traceBtn').addEventListener('click', doTrace);
 
 // ---- Init ----
 async function init() {
