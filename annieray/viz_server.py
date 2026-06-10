@@ -232,6 +232,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <input type="range" id="bottomRot" min="-180" max="180" step="22.5" value="135"></label>
   <label style="margin-top:6px;"><input type="checkbox" id="structGrey"> Grey Structure</label>
   <label style="margin-top:2px;"><input type="checkbox" id="pmtGrey"> Grey PMTs</label>
+  <label style="margin-top:2px;"><input type="checkbox" id="showCone" checked> Show Cone Guide</label>
   <hr style="margin:8px 0;border:none;border-top:1px solid rgba(0,0,0,0.15);">
   <h3 style="margin-top:6px;">View</h3>
   <label>Azimuth <span id="viewAzVal">36</span>
@@ -409,9 +410,11 @@ function updateMuonAndLight(pos, dir) {
     coneVisual.quaternion.copy(new THREE.Quaternion().setFromUnitVectors(upDir, d));
     coneVisual.castShadow = false;
     coneVisual.receiveShadow = false;
+    coneVisual.visible = document.getElementById('showCone').checked;
     scene.add(coneVisual);
 
     // Spotlight follows muon vertex
+    spotLight.visible = coneVisual.visible;
     spotLight.position.copy(p);
     const targetPos = p.clone().add(d.clone().multiplyScalar(3000));
     spotTarget.position.copy(targetPos);
@@ -447,6 +450,12 @@ phiSlider.addEventListener('input', updateScene);
 document.getElementById('mx').addEventListener('change', updateScene);
 document.getElementById('my').addEventListener('change', updateScene);
 document.getElementById('mz').addEventListener('change', updateScene);
+document.getElementById('showCone').addEventListener('change', () => {
+    const visible = document.getElementById('showCone').checked;
+    if (coneVisual) coneVisual.visible = visible;
+    if (spotLight) spotLight.visible = visible;
+    if (spotTarget) spotTarget.visible = visible;
+});
 
 // ---- Init ----
 async function init() {
