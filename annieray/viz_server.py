@@ -414,7 +414,6 @@ function updateMuonAndLight(pos, dir) {
     scene.add(coneVisual);
 
     // Spotlight follows muon vertex
-    spotLight.visible = coneVisual.visible;
     spotLight.position.copy(p);
     const targetPos = p.clone().add(d.clone().multiplyScalar(3000));
     spotTarget.position.copy(targetPos);
@@ -451,10 +450,7 @@ document.getElementById('mx').addEventListener('change', updateScene);
 document.getElementById('my').addEventListener('change', updateScene);
 document.getElementById('mz').addEventListener('change', updateScene);
 document.getElementById('showCone').addEventListener('change', () => {
-    const visible = document.getElementById('showCone').checked;
-    if (coneVisual) coneVisual.visible = visible;
-    if (spotLight) spotLight.visible = visible;
-    if (spotTarget) spotTarget.visible = visible;
+    if (coneVisual) coneVisual.visible = document.getElementById('showCone').checked;
 });
 
 // ---- Init ----
