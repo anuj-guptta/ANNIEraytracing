@@ -142,14 +142,19 @@ class VizHandler(BaseHTTPRequestHandler):
 
         rng = np.random.default_rng()
         t0 = time.time()
-        pmt_hits, struct_positions = trace_cherenkov(
+        hits = trace_cherenkov(
             (mx, my, mz), (dx, dy, dz), n, geometry, rng=rng,
         )
         elapsed = time.time() - t0
-        total_hits = int(pmt_hits.sum())
+
+        pmt_hits = hits[:, 0].astype(int).tolist()
+        struct_mask = hits[:, 8] == 1.0
+        struct_positions = hits[struct_mask, 2:5].tolist()
+        total_hits = int(hits[:, 0].sum())
+
         self._send_json({
-            "pmt_hits": pmt_hits.tolist(),
-            "struct_hits": struct_positions.tolist(),
+            "pmt_hits": pmt_hits,
+            "struct_hits": struct_positions,
             "total_hits": total_hits,
             "total_photons": n,
             "time_ms": round(elapsed * 1000, 1),
