@@ -4,7 +4,7 @@ Serves a Three.js frontend with real-time ray tracing of Cherenkov cones
 from a user-controlled muon track.
 
 Usage:
-    python -m annieray viz-server --gdml PHASE2_INNER_STRUCTURE.gdml \
+    python -m annieray viz-server \
         --pmt-csv PMTPositions_Scan.txt
 """
 
@@ -151,14 +151,22 @@ class VizHandler(BaseHTTPRequestHandler):
 
         # Return positions by component type — these are drawn as dots
         comp = hits[:, 8]
-        pmt_positions = hits[comp == 2.0, 2:5].tolist()
+        pmt_positions    = hits[comp == 2.0, 2:5].tolist()
         struct_positions = hits[comp == 1.0, 2:5].tolist()
-        tank_positions  = hits[comp == 4.0, 2:5].tolist()
+        lappd_positions  = hits[comp == 3.0, 2:5].tolist()
+        tank_positions   = hits[comp == 4.0, 2:5].tolist()
 
         self._send_json({
             "pmt_positions": pmt_positions,
             "struct_positions": struct_positions,
+            "lappd_positions": lappd_positions,
             "tank_positions": tank_positions,
+            "counts": {
+                "pmt": len(pmt_positions),
+                "struct": len(struct_positions),
+                "lappd": len(lappd_positions),
+                "tank": len(tank_positions),
+            },
             "total_hits": total_hits,
             "total_photons": n,
             "time_ms": round(elapsed * 1000, 1),
@@ -237,6 +245,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <label style="margin-top:6px;"><input type="checkbox" id="structGrey"> Grey Structure</label>
   <label style="margin-top:2px;"><input type="checkbox" id="pmtGrey"> Grey PMTs</label>
   <label style="margin-top:2px;"><input type="checkbox" id="showCone" checked> Show Cone Guide</label>
+  <label style="margin-top:2px;"><input type="checkbox" id="showRayLines"> Show Ray Lines</label>
   <button id="traceBtn" style="margin-top:8px;">Trace Cherenkov Photons</button>
   <div id="traceResult" style="margin-top:6px;font-size:12px;line-height:1.5;"></div>
   <hr style="margin:8px 0;border:none;border-top:1px solid rgba(0,0,0,0.15);">
@@ -274,6 +283,7 @@ let spotTarget = null;
 let housingData = null;
 let boxMesh = null;
 let tracePoints = null;   // group of dot meshes for traced photon hits
+let rayLines = null;      // group of line meshes for sampled ray paths
 let traceResultEl = null;
 
 // ---- DOM refs ----
@@ -479,6 +489,7 @@ async function doTrace() {
         const dotGeo = new THREE.SphereGeometry(8, 6, 6);
         const pmtMat = new THREE.MeshBasicMaterial({ color: 0x44dd88 });
         const structMat = new THREE.MeshBasicMaterial({ color: 0xff8844 });
+        const lappdMat = new THREE.MeshBasicMaterial({ color: 0xdd44dd });
         const tankMat = new THREE.MeshBasicMaterial({ color: 0x4488ff });
 
         tracePoints = new THREE.Group();
@@ -492,6 +503,11 @@ async function doTrace() {
             m.position.set(p[0], p[1], p[2]);
             tracePoints.add(m);
         }
+        for (const p of data.lappd_positions) {
+            const m = new THREE.Mesh(dotGeo, lappdMat);
+            m.position.set(p[0], p[1], p[2]);
+            tracePoints.add(m);
+        }
         for (const p of data.tank_positions) {
             const m = new THREE.Mesh(dotGeo, tankMat);
             m.position.set(p[0], p[1], p[2]);
@@ -499,10 +515,48 @@ async function doTrace() {
         }
         scene.add(tracePoints);
 
+        // Ray lines: sample up to 500 lines from muon vertex to hit positions
+        if (rayLines) scene.remove(rayLines);
+        const showLines = document.getElementById('showRayLines').checked;
+        if (showLines && data.total_hits > 0) {
+            const muonPos = new THREE.Vector3(
+                parseFloat(document.getElementById('mx').value),
+                parseFloat(document.getElementById('my').value),
+                parseFloat(document.getElementById('mz').value),
+            );
+            // Collect all hit positions
+            const allHits = [];
+            for (const p of data.pmt_positions) allHits.push({ pos: p, color: 0x44dd88 });
+            for (const p of data.struct_positions) allHits.push({ pos: p, color: 0xff8844 });
+            for (const p of data.lappd_positions) allHits.push({ pos: p, color: 0xdd44dd });
+            for (const p of data.tank_positions) allHits.push({ pos: p, color: 0x4488ff });
+            // Sample
+            const maxLines = 500;
+            const step = Math.max(1, Math.floor(allHits.length / maxLines));
+            const lineGroup = new THREE.Group();
+            for (let i = 0; i < allHits.length; i += step) {
+                const h = allHits[i];
+                const geo = new THREE.BufferGeometry().setFromPoints([
+                    muonPos,
+                    new THREE.Vector3(h.pos[0], h.pos[1], h.pos[2]),
+                ]);
+                const mat = new THREE.LineBasicMaterial({
+                    color: h.color,
+                    transparent: true,
+                    opacity: 0.25,
+                });
+                lineGroup.add(new THREE.Line(geo, mat));
+            }
+            rayLines = lineGroup;
+            scene.add(rayLines);
+        }
+
+        const c = data.counts;
         traceResultEl.innerHTML = `<b>${data.total_hits}</b>/<b>${data.total_photons}</b> hits `
-            + `(PMT <b>${data.pmt_positions.length}</b>, `
-            + `struct <b>${data.struct_positions.length}</b>, `
-            + `tank <b>${data.tank_positions.length}</b>) `
+            + `(PMT <b>${c.pmt}</b>, `
+            + `struct <b>${c.struct}</b>, `
+            + `LAPPD <b>${c.lappd}</b>, `
+            + `tank <b>${c.tank}</b>) `
             + `in ${data.time_ms} ms`;
     } catch (e) {
         traceResultEl.textContent = 'Trace failed: ' + e.message;
@@ -520,6 +574,9 @@ document.getElementById('my').addEventListener('change', updateScene);
 document.getElementById('mz').addEventListener('change', updateScene);
 document.getElementById('showCone').addEventListener('change', () => {
     if (coneVisual) coneVisual.visible = document.getElementById('showCone').checked;
+});
+document.getElementById('showRayLines').addEventListener('change', () => {
+    if (rayLines) rayLines.visible = document.getElementById('showRayLines').checked;
 });
 document.getElementById('traceBtn').addEventListener('click', doTrace);
 

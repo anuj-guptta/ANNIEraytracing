@@ -25,7 +25,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="Run ray tracing")
-    run.add_argument("--gdml", required=True, type=Path, help="Path to InnerStructure.gdml")
+    run.add_argument("--gdml", type=Path, default=Path("PHASE2_INNER_STRUCTURE_closed.gdml"),
+                     help="Path to GDML geometry mesh (default: PHASE2_INNER_STRUCTURE_closed.gdml)")
     run.add_argument("--step", type=Path, default=None, help="Path to STEP CAD file")
     run.add_argument("--manifest", type=Path, default=None, help="Path to cached component manifest JSON")
     run.add_argument("--pmt-csv", type=Path, default=None, help="Path to PMT scan file or CSV (default: PMTPositions_Scan.txt near GDML)")
@@ -51,7 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     cherenkov.add_argument("--output", "-o", type=Path, default=Path("component_manifest.json"), help="Output JSON path")
 
     viz = sub.add_parser("viz-server", help="Start interactive Cherenkov visualization server")
-    viz.add_argument("--gdml", required=True, type=Path, help="Path to InnerStructure.gdml")
+    viz.add_argument("--gdml", type=Path, default=Path("PHASE2_INNER_STRUCTURE_closed.gdml"),
+                     help="Path to GDML geometry mesh (default: PHASE2_INNER_STRUCTURE_closed.gdml)")
     viz.add_argument("--step", type=Path, default=None, help="Path to STEP CAD file for component positions")
     viz.add_argument("--manifest", type=Path, default=None, help="Path to cached component manifest JSON")
     viz.add_argument("--pmt-csv", type=Path, default=None, help="Path to PMT scan file")
@@ -64,7 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     detcfg = sub.add_parser("build-detector-config",
                             help="Build detector registry YAML from geometry")
-    detcfg.add_argument("--gdml", required=True, type=Path, help="Path to InnerStructure.gdml")
+    detcfg.add_argument("--gdml", type=Path, default=Path("PHASE2_INNER_STRUCTURE_closed.gdml"),
+                        help="Path to GDML geometry mesh (default: PHASE2_INNER_STRUCTURE_closed.gdml)")
     detcfg.add_argument("--step", type=Path, default=None, help="Path to STEP CAD file")
     detcfg.add_argument("--manifest", type=Path, default=None, help="Path to cached component manifest JSON")
     detcfg.add_argument("--pmt-csv", type=Path, default=None, help="Path to PMT scan file")

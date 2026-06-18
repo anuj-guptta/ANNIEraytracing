@@ -4,7 +4,8 @@
 
 | File | Format | Role |
 |---|---|---|
-| `InnerStructure.gdml` / `PHASE2_INNER_STRUCTURE.gdml` | GDML (XML) | Triangulated inner structure mesh (panels, unistruts). Primary geometry for raytracing. |
+| `InnerStructure.gdml` / `PHASE2_INNER_STRUCTURE.gdml` | GDML (XML) | Original disconnected triangle soup (laser scan). |
+| `PHASE2_INNER_STRUCTURE_closed.gdml` | GDML (XML) | Closed contiguous surface mesh (vertex-deduplicated, no boundary edges). Primary geometry for raytracing. |
 | `PMTPositions_Scan.txt` | TSV | 132 PMT positions in WCSim scan coordinates. Preferred PMT source. |
 | `F10091903_-.step` | STEP AP242 | Full CAD assembly; fallback for PMT/LAPPD positions when no scan file is available. |
 | `component_manifest.json` | JSON | Cached output of STEP parser — avoids re-parsing the 196K-line STEP file. |

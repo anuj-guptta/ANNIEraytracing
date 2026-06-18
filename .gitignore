@@ -13,6 +13,17 @@ hits.parquet
 detectors.yaml
 component_manifest.json
 
+# Large CAD source files
+*.step
+*.stp
+
+# Generated GDML meshes
+pmt_meshes/
+PHASE2_INNER_STRUCTURE_closed.gdml
+
+# Scratch scripts
+analyze_step.py
+
 # IDE
 .vscode/
 .idea/

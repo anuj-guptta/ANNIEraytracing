@@ -8,21 +8,21 @@ recording hit positions, local coordinates, arrival times, and wavelengths.
 
 ```bash
 # Uniform mode: random photon directions inside the tank
-python -m annieray run --gdml PHASE2_INNER_STRUCTURE.gdml \
+python -m annieray run \
     --pmt-csv PMTPositions_Scan.txt \
     --photons 100000 --mode uniform -o hits.parquet
 
 # Cherenkov mode: photons from a muon vertex on a Cherenkov cone
-python -m annieray run --gdml PHASE2_INNER_STRUCTURE.gdml \
+python -m annieray run \
     --pmt-csv PMTPositions_Scan.txt \
     --photons 100000 --mode cherenkov --wavelength 350 -o hits.parquet
 
 # Build detector registry YAML (one-time setup for model coupling)
-python -m annieray build-detector-config --gdml PHASE2_INNER_STRUCTURE.gdml \
+python -m annieray build-detector-config \
     --pmt-csv PMTPositions_Scan.txt -o detectors.yaml
 
 # Interactive 3D viewer
-python -m annieray viz-server --gdml PHASE2_INNER_STRUCTURE.gdml \
+python -m annieray viz-server \
     --pmt-csv PMTPositions_Scan.txt --port 8080
 ```
 

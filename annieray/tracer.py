@@ -141,20 +141,14 @@ def build_geometry(
     elif step_path:
         manifest = step_parser.parse_step(step_path)
 
-    # ---- Tank bounds (from manifest or hard-coded defaults) ----
+    # ---- Tank bounds ----
     # Used for the infinite-cylinder tank-wall intersection and for computing
     # the Z-centre when placing the ANNIE housing on the octagon.
-    if manifest and manifest.tank_bbox:
-        tank_radius = max(
-            manifest.tank_bbox.xmax - manifest.tank_bbox.xmin,
-            manifest.tank_bbox.ymax - manifest.tank_bbox.ymin,
-        ) / 2
-        tank_z_min = manifest.tank_bbox.zmin
-        tank_z_max = manifest.tank_bbox.zmax
-    else:
-        tank_radius = 1264.0
-        tank_z_min = 19.0
-        tank_z_max = 3861.0
+    # The inner-structure manifest bbox does NOT reflect the tank dimensions,
+    # so we always use hardcoded defaults (10 ft diameter, from detector specs).
+    tank_radius = 1524.0
+    tank_z_min = 19.0
+    tank_z_max = 3861.0
 
     # Active LAPPD positions (shared by default rectangles and housing model)
     lappd_sources: list[tuple[float, float, float]] | None = None

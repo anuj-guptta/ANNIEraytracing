@@ -1,0 +1,156 @@
+{
+  "base_10inch": {
+    "count": 28,
+    "volume": 6942847.8,
+    "bounding_box_dims": [
+      337.7,
+      310.9,
+      254.0
+    ],
+    "sample_center": [
+      -694.3,
+      897.4,
+      2115.6
+    ]
+  },
+  "base_8inch": {
+    "count": 28,
+    "volume": 6942847.8,
+    "bounding_box_dims": [
+      254.0,
+      339.8,
+      254.0
+    ],
+    "sample_center": [
+      152.2,
+      -1122.8,
+      2115.6
+    ]
+  },
+  "etel_top": {
+    "count": 12,
+    "volume": 11747811.1,
+    "bounding_box_dims": [
+      480.7,
+      315.8,
+      367.0
+    ],
+    "sample_center": [
+      805.8,
+      -172.9,
+      3623.0
+    ]
+  },
+  "glass_10inch": {
+    "count": 40,
+    "volume": 3913226.9,
+    "bounding_box_dims": [
+      260.3,
+      260.4,
+      202.0
+    ],
+    "sample_center": [
+      -983.5,
+      -731.3,
+      1278.4
+    ]
+  },
+  "glass_8inch": {
+    "count": 40,
+    "volume": 3738631.9,
+    "bounding_box_dims": [
+      252.8,
+      252.8,
+      202.0
+    ],
+    "sample_center": [
+      -983.5,
+      -731.9,
+      1278.3
+    ]
+  },
+  "holder_narrow": {
+    "count": 28,
+    "volume": 73755.2,
+    "bounding_box_dims": [
+      25.4,
+      67.8,
+      165.1
+    ],
+    "sample_center": [
+      1220.6,
+      116.3,
+      1252.5
+    ]
+  },
+  "holder_narrow_rotated": {
+    "count": 28,
+    "volume": 73755.2,
+    "bounding_box_dims": [
+      67.8,
+      25.4,
+      165.1
+    ],
+    "sample_center": [
+      189.0,
+      1220.6,
+      2978.7
+    ]
+  },
+  "holder_square": {
+    "count": 56,
+    "volume": 73755.2,
+    "bounding_box_dims": [
+      65.9,
+      65.9,
+      165.1
+    ],
+    "sample_center": [
+      -945.3,
+      780.8,
+      2115.6
+    ]
+  },
+  "lux_bottom": {
+    "count": 2,
+    "volume": 10606531.3,
+    "bounding_box_dims": [
+      252.8,
+      252.8,
+      374.0
+    ],
+    "sample_center": [
+      555.2,
+      479.4,
+      310.2
+    ]
+  },
+  "lux_bottom_wide": {
+    "count": 12,
+    "volume": 10724418.4,
+    "bounding_box_dims": [
+      315.8,
+      480.7,
+      367.0
+    ],
+    "sample_center": [
+      38.9,
+      265.5,
+      313.7
+    ]
+  },
+  "perch": {
+    "count": 224,
+    "volume": 41872.2,
+    "bounding_box_dims": [
+      64.0,
+      98.9,
+      76.3
+    ],
+    "sample_center": [
+      -995.3,
+      686.4,
+      2194.2
+    ]
+  }
+}

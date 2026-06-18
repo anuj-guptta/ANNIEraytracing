@@ -9,7 +9,16 @@ from typing import Tuple
 import numpy as np
 from lxml import etree
 
-VERTEX_PATTERN = re.compile(r"stl_v(\d+)")
+# Matches stl_v42, v42, or PHASE2_INNER_STRUCTURE.stl_v42
+_VNAME_PATTERN = re.compile(r"(?:stl_)?v(\d+)")
+
+
+def _extract_index(name: str) -> int:
+    m = _VNAME_PATTERN.search(name)
+    if m is None:
+        msg = f"Cannot extract vertex index from '{name}'"
+        raise ValueError(msg)
+    return int(m.group(1))
 
 
 def parse_gdml(path: Path) -> Tuple[np.ndarray, np.ndarray]:
@@ -28,11 +37,7 @@ def parse_gdml(path: Path) -> Tuple[np.ndarray, np.ndarray]:
     vertices = np.empty((n_verts, 3), dtype=np.float32)
 
     for pos in positions:
-        name = pos.get("name")
-        m = VERTEX_PATTERN.search(name)
-        if m is None:
-            continue
-        idx = int(m.group(1))
+        idx = _extract_index(pos.get("name"))
         vertices[idx, 0] = float(pos.get("x"))
         vertices[idx, 1] = float(pos.get("y"))
         vertices[idx, 2] = float(pos.get("z"))
@@ -43,7 +48,6 @@ def parse_gdml(path: Path) -> Tuple[np.ndarray, np.ndarray]:
     for i, tri in enumerate(triangles_elem):
         for j, attr in enumerate(("vertex1", "vertex2", "vertex3")):
             v = tri.get(attr)
-            m = VERTEX_PATTERN.search(v)
-            triangles[i, j] = int(m.group(1))
+            triangles[i, j] = _extract_index(v)
 
     return vertices, triangles
