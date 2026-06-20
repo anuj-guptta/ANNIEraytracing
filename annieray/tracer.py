@@ -99,6 +99,7 @@ def build_geometry(
     no_lappd: bool = False,
     z_offset: float = 0.0,
     lappd_model: str = "default",
+    bottom_rotation_deg: float = 45.0,
 ) -> Geometry:
     """Build a Geometry from a GDML file and optional PMT/STEP data sources.
 
@@ -118,7 +119,8 @@ def build_geometry(
     # The CSV is preferred because it has per-PMT radii and type names.
     pmt_directions = np.zeros((0, 3), dtype=np.float32)
     if pmt_csv_path and pmt_csv_path.exists():
-        pmt_data = pmt_loader.load_pmts(pmt_csv_path, z_offset=z_offset)
+        pmt_data = pmt_loader.load_pmts(pmt_csv_path, z_offset=z_offset,
+                                         bottom_rotation_deg=bottom_rotation_deg)
         pmt_centers = pmt_data["centers"]
         pmt_radii = pmt_data["radii"]
         pmt_directions = pmt_data["directions"]

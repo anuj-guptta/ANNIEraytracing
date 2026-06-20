@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import time
+import xml.etree.ElementTree as ET
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -21,8 +22,53 @@ import numpy as np
 from annieray.tracer import build_geometry, trace_cherenkov
 
 geometry = None
-n_pmts = 0
 
+pmt_instance_data: dict | None = None   # from pmt_loader
+
+# ---- PMT mesh caching ----
+MESH_DIR = Path("pmt_meshes")
+
+def _parse_gdml_flattened(path: Path, recenter=True):
+    """Parse GDML and return (binary float32 data, vertex_count)."""
+    tree = ET.parse(path)
+    root = tree.getroot()
+    positions = root.findall(".//position")
+    verts = {
+        p.attrib["name"]: (float(p.attrib["x"]), float(p.attrib["y"]), float(p.attrib["z"]))
+        for p in positions
+    }
+    triangles = root.findall(".//triangular")
+    out = []
+    for tri in triangles:
+        for key in ("vertex1", "vertex2", "vertex3"):
+            out.extend(verts[tri.attrib[key]])
+    arr = np.array(out, dtype=np.float32).reshape(-1, 3)
+    if recenter:
+        arr -= arr.mean(axis=0)
+    return arr.tobytes(), len(arr)
+
+# Pre-parse single-instance PMT assembly meshes.
+# Keys align with PMT_MESH_TYPE in pmt_loader.py:
+#   0 = LUX (lux_bottom),  1 = ETEL (etel_top),
+#   2 = Hamamatsu (8" body),  3 = Watchboy/Watchman (10" body)
+# Each GDML file is a single tessellated PMT assembly (merged by extraction,
+# but there are no physvol — the "count" in metadata is the detector count).
+PMT_MESH_CACHE: dict[int, bytes] = {}
+for _mi, _gn, _rc in [(0, "pmt_lux_bottom.gdml", True),
+                       (1, "pmt_etel_top.gdml", True),
+                       (2, "pmt_8inch_body.gdml", False),
+                       (3, "pmt_10inch_body.gdml", False),
+                       (4, "pmt_8inch_hardware.gdml", False),
+                       (5, "pmt_10inch_hardware.gdml", False)]:
+    _p = MESH_DIR / _gn
+    if _p.exists():
+        _d, _nv = _parse_gdml_flattened(_p, recenter=_rc)
+        PMT_MESH_CACHE[_mi] = _d
+        print(f"  PMT mesh {_mi} ({_gn}): {_nv // 3} tris")
+    else:
+        print(f"  PMT mesh {_mi} ({_gn}): NOT FOUND")
+
+# ---------------------------------------------------------------------------
 
 class VizHandler(BaseHTTPRequestHandler):
     _pmt_types: list[str] = []
@@ -66,6 +112,8 @@ class VizHandler(BaseHTTPRequestHandler):
             self._send_lappd_housing()
         elif path == "/api/detectors":
             self._send_detectors()
+        elif path.startswith("/api/pmt_mesh/"):
+            self._send_pmt_mesh(path)
         else:
             self.send_error(404)
 
@@ -110,21 +158,51 @@ class VizHandler(BaseHTTPRequestHandler):
         self.wfile.write(HTML_PAGE.encode())
 
     def _send_pmts(self):
-        centers = geometry.pmt_centers.tolist()
-        radii = geometry.pmt_radii.tolist()
-        self._send_json({
-            "centers": centers,
-            "radii": radii,
+        c = np.asarray(geometry.pmt_centers)
+        d = np.asarray(pmt_instance_data["directions"]) if pmt_instance_data else np.empty((0, 3))
+        resp = {
+            "centers": c.tolist(),
+            "radii": geometry.pmt_radii.tolist(),
             "types": self._pmt_types,
-        })
+            "directions": d.tolist(),
+        }
+        if pmt_instance_data is not None:
+            resp["mesh_types"] = pmt_instance_data["mesh_types"].tolist()
+            resp["quaternions"] = pmt_instance_data["quaternions"].tolist()
+            resp["instance_positions"] = pmt_instance_data["instance_positions"].tolist()
+            # Hardware mesh type per PMT (4=8" HW, 5=10" HW, -1=none)
+            hw = []
+            for t in self._pmt_types:
+                if t == "Hamamatsu":
+                    hw.append(4)
+                elif t in ("Watchboy", "Watchman"):
+                    hw.append(5)
+                else:
+                    hw.append(-1)
+            resp["hw_mesh_types"] = hw
+        self._send_json(resp)
 
     def _send_mesh_verts(self):
+        # Mesh is in GDML rest frame (Z-up structure frame).
+        # Three.js camera is also Z-up — no transform needed.
         buf = geometry.mesh_vertices.astype(np.float32).tobytes()
         self._send_binary(buf)
 
     def _send_mesh_tris(self):
         buf = geometry.mesh_triangles.astype(np.int32).tobytes()
         self._send_binary(buf)
+
+    def _send_pmt_mesh(self, path):
+        try:
+            type_idx = int(path.split("/")[-1])
+        except (ValueError, IndexError):
+            self._send_json({"error": "invalid type"}, 400)
+            return
+        data = PMT_MESH_CACHE.get(type_idx)
+        if data is None:
+            self._send_json({"error": "mesh type not available"}, 404)
+            return
+        self._send_binary(data)
 
     def _handle_trace(self, params):
         try:
@@ -240,10 +318,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <button id="focusLAPPD" disabled>Focus on LAPPD</button>
   <label style="margin-top:6px;"><input type="checkbox" id="lappdGrey"> Grey LAPPD</label>
   <hr style="margin:8px 0;border:none;border-top:1px solid rgba(0,0,0,0.1);">
-  <label>Bottom Rot <span id="bottomRotVal">135</span>
-    <input type="range" id="bottomRot" min="-180" max="180" step="22.5" value="135"></label>
   <label style="margin-top:6px;"><input type="checkbox" id="structGrey"> Grey Structure</label>
   <label style="margin-top:2px;"><input type="checkbox" id="pmtGrey"> Grey PMTs</label>
+  <label style="margin-top:2px;"><input type="checkbox" id="showHW"> Show Holders</label>
   <label style="margin-top:2px;"><input type="checkbox" id="showCone" checked> Show Cone Guide</label>
   <label style="margin-top:2px;"><input type="checkbox" id="showRayLines"> Show Ray Lines</label>
   <button id="traceBtn" style="margin-top:8px;">Trace Cherenkov Photons</button>
@@ -275,7 +352,6 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 // ---- State ----
-let pmtMeshes = [];
 let muonGroup = null;
 let coneVisual = null;
 let spotLight = null;
@@ -338,17 +414,83 @@ spotLight.shadow.bias = 0;
 spotLight.shadow.normalBias = 0;
 scene.add(spotLight);
 
-// Grid helper
+// Grid helper (horizontal, Z-up frame)
 const grid = new THREE.GridHelper(3000, 20, 0x8899aa, 0x667788);
-grid.position.y = 2000;
+grid.position.z = 2000;
 grid.receiveShadow = false;
 scene.add(grid);
 
-// Axes
-const axes = new THREE.AxesHelper(500);
-scene.add(axes);
+// ---- Labeled axes + origin ----
+function makeTextSprite(text, color) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 128;
+    canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    ctx.font = 'Bold 48px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = color;
+    ctx.fillText(text, 64, 32);
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.needsUpdate = true;
+    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set(200, 100, 1);
+    return sprite;
+}
 
-// ---- Material colors ----
+function addAxesAndOrigin() {
+    const axisLen = 600;
+    const group = new THREE.Group();
+
+    // Axis arrows
+    const axisDefs = [
+        { dir: [1,0,0], color: 0xff0000, label: 'X' },
+        { dir: [0,1,0], color: 0x00ff00, label: 'Y' },
+        { dir: [0,0,1], color: 0x0066ff, label: 'Z' },
+    ];
+    for (const a of axisDefs) {
+        const d = new THREE.Vector3(a.dir[0], a.dir[1], a.dir[2]);
+        const arrow = new THREE.ArrowHelper(d, new THREE.Vector3(0,0,0),
+            axisLen, a.color, 80, 40);
+        group.add(arrow);
+
+        // Label at tip
+        const tip = d.clone().multiplyScalar(axisLen * 1.25);
+        const sp = makeTextSprite(a.label, '#' + a.color.toString(16).padStart(6, '0'));
+        sp.position.copy(tip);
+        group.add(sp);
+    }
+
+    // Negative axis stubs (dashed or thin)
+    for (const a of axisDefs) {
+        const d = new THREE.Vector3(-a.dir[0], -a.dir[1], -a.dir[2]);
+        const mat = new THREE.LineBasicMaterial({
+            color: a.color, transparent: true, opacity: 0.25,
+        });
+        const pts = [new THREE.Vector3(0,0,0), d.clone().multiplyScalar(axisLen * 0.4)];
+        const geo = new THREE.BufferGeometry().setFromPoints(pts);
+        group.add(new THREE.Line(geo, mat));
+    }
+
+    // Origin sphere
+    const originGeo = new THREE.SphereGeometry(20, 16, 12);
+    const originMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+    const originMesh = new THREE.Mesh(originGeo, originMat);
+    originMesh.position.set(0, 0, 0);
+    group.add(originMesh);
+
+    // "O" label
+    const oLabel = makeTextSprite('O', '#000000');
+    oLabel.position.set(0, -70, 0);
+    group.add(oLabel);
+
+    scene.add(group);
+}
+
+addAxesAndOrigin();
+
+// ---- Material colours ----
 const SURFACE_COLOR = new THREE.Color(0xffffff);
 const GREY_COLOR = new THREE.Color(0x999999);
 
@@ -376,25 +518,14 @@ async function loadPMTs() {
     return await resp.json();
 }
 
-const pmtMat = new THREE.MeshPhysicalMaterial({
-    color: 0xffffff,
-    roughness: 0.05,
-    metalness: 0.0,
-    transmission: 0.85,
-    thickness: 0.5,
-    ior: 1.5,
-    envMapIntensity: 1.0,
-    clearcoat: 0.0,
-});
-
-function createPMTSphere(center, radius) {
-    const geo = new THREE.SphereGeometry(radius, 28, 22);
-    const mesh = new THREE.Mesh(geo, pmtMat);
-    mesh.position.set(center[0], center[1], center[2]);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    return mesh;
-}
+// ---- PMT type colours ----
+const PMT_COLORS = {
+    'LUX': 0xffaa00,
+    'ETEL': 0x00ccff,
+    'Hamamatsu': 0x44aaff,
+    'Watchboy': 0xff8844,
+    'Watchman': 0xff8844,
+};
 
 // ---- Muon + light update ----
 function updateMuonAndLight(pos, dir) {
@@ -616,16 +747,122 @@ async function init() {
 
         statusEl.textContent = 'Loading PMTs…';
         const pmtData = await loadPMTs();
-        pmtMeshes = pmtData.centers.map((c, i) => {
-            const mesh = createPMTSphere(c, pmtData.radii[i]);
-            mesh.userData.type = pmtData.types[i];
-            scene.add(mesh);
-            return mesh;
-        });
-        // Store original positions for bottom PMT rotation
-        const origPMTPos = pmtData.centers.map(c => new THREE.Vector3(c[0], c[1], c[2]));
-        const isBottomPMT = pmtData.types.map(t => t === 'LUX');
-        statusEl.textContent = `Loaded ${pmtMeshes.length} PMTs.`;
+
+        // Load PMT mesh geometries for needed types
+        const meshGeos = {};
+        const hwMeshGeos = {};
+        const neededTypes = new Set(pmtData.mesh_types || []);
+        const neededHwTypes = new Set((pmtData.hw_mesh_types || []).filter(v => v >= 0));
+        for (const mt of neededTypes) {
+            try {
+                const resp = await fetch(`/api/pmt_mesh/${mt}`);
+                if (resp.ok) {
+                    const buf = await resp.arrayBuffer();
+                    const flat = new Float32Array(buf);
+                    const geo = new THREE.BufferGeometry();
+                    geo.setAttribute('position', new THREE.BufferAttribute(flat, 3));
+                    geo.computeVertexNormals();
+                    meshGeos[mt] = geo;
+                }
+            } catch (e) {
+                console.warn(`No mesh for type ${mt}`);
+            }
+        }
+        for (const mt of neededHwTypes) {
+            try {
+                const resp = await fetch(`/api/pmt_mesh/${mt}`);
+                if (resp.ok) {
+                    const buf = await resp.arrayBuffer();
+                    const flat = new Float32Array(buf);
+                    const geo = new THREE.BufferGeometry();
+                    geo.setAttribute('position', new THREE.BufferAttribute(flat, 3));
+                    geo.computeVertexNormals();
+                    hwMeshGeos[mt] = geo;
+                }
+            } catch (e) {
+                console.warn(`No HW mesh for type ${mt}`);
+            }
+        }
+
+        // Render PMTs
+        const pmtGroup = new THREE.Group();
+        const pmtHWGroup = new THREE.Group();
+        for (let i = 0; i < pmtData.centers.length; i++) {
+            const c = pmtData.centers[i];
+            const r = pmtData.radii[i];
+            const d = pmtData.directions[i];
+            const type = pmtData.types[i];
+            const color = PMT_COLORS[type] || 0x999999;
+
+            const mt = pmtData.mesh_types ? pmtData.mesh_types[i] : -1;
+            const geo = meshGeos[mt];
+
+            if (geo) {
+                const mat = new THREE.MeshPhysicalMaterial({
+                    color: color,
+                    roughness: 0.3,
+                    metalness: 0.0,
+                    transparent: true,
+                    opacity: 0.85,
+                    side: THREE.DoubleSide,
+                });
+                const mesh = new THREE.Mesh(geo, mat);
+                const ip = pmtData.instance_positions[i];
+                mesh.position.set(ip[0], ip[1], ip[2]);
+                const q = pmtData.quaternions[i];
+                mesh.quaternion.set(q[0], q[1], q[2], q[3]);
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                mesh.userData.pmtIdx = i;
+                pmtGroup.add(mesh);
+
+                // Hardware mesh at same position/orientation
+                const hwmt = pmtData.hw_mesh_types ? pmtData.hw_mesh_types[i] : -1;
+                const hwGeo = hwMeshGeos[hwmt];
+                if (hwGeo) {
+                    const hwMat = new THREE.MeshPhysicalMaterial({
+                        color: 0x887766,
+                        roughness: 0.5,
+                        metalness: 0.3,
+                        transparent: true,
+                        opacity: 0.7,
+                        side: THREE.DoubleSide,
+                    });
+                    const hwMesh = new THREE.Mesh(hwGeo, hwMat);
+                    hwMesh.position.set(ip[0], ip[1], ip[2]);
+                    hwMesh.quaternion.set(q[0], q[1], q[2], q[3]);
+                    hwMesh.castShadow = true;
+                    hwMesh.receiveShadow = true;
+                    hwMesh.userData.pmtIdx = i;
+                    pmtHWGroup.add(hwMesh);
+                }
+            } else {
+                const sphereGeo = new THREE.SphereGeometry(r * 0.35, 16, 12);
+                const sphereMat = new THREE.MeshStandardMaterial({
+                    color: color,
+                    roughness: 0.4,
+                    metalness: 0.05,
+                    transparent: true,
+                    opacity: 0.85,
+                });
+                const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+                sphere.position.set(c[0], c[1], c[2]);
+                sphere.castShadow = true;
+                sphere.receiveShadow = true;
+                sphere.userData.pmtIdx = i;
+                pmtGroup.add(sphere);
+            }
+
+            const dir = new THREE.Vector3(d[0], d[1], d[2]).normalize();
+            const origin = new THREE.Vector3(c[0], c[1], c[2]);
+            const arrow = new THREE.ArrowHelper(dir, origin, 50, color, 18, 10);
+            pmtGroup.add(arrow);
+        }
+        scene.add(pmtGroup);
+        pmtHWGroup.visible = false;
+        scene.add(pmtHWGroup);
+
+        statusEl.textContent = `Loaded ${pmtData.centers.length} PMTs.`;
 
         // Load ANNIE LAPPD housing (if present)
         const housingResp = await fetch('/api/housing');
@@ -730,28 +967,6 @@ async function init() {
             document.getElementById('focusLAPPD').disabled = false;
         }
 
-        // ---- Bottom PMT rotation slider ----
-        const bottomRotSlider = document.getElementById('bottomRot');
-        const bottomRotVal = document.getElementById('bottomRotVal');
-
-        function rotateBottomPMTs() {
-            const angle = parseFloat(bottomRotSlider.value) * Math.PI / 180;
-            const cosA = Math.cos(angle);
-            const sinA = Math.sin(angle);
-            for (let i = 0; i < pmtMeshes.length; i++) {
-                if (isBottomPMT[i]) {
-                    const orig = origPMTPos[i];
-                    const x = orig.x * cosA - orig.y * sinA;
-                    const y = orig.x * sinA + orig.y * cosA;
-                    pmtMeshes[i].position.set(x, y, orig.z);
-                }
-            }
-            bottomRotVal.textContent = bottomRotSlider.value;
-        }
-
-        bottomRotSlider.addEventListener('input', rotateBottomPMTs);
-        rotateBottomPMTs();  // apply default 135°
-
         // ---- Grey toggles for structure and PMTs ----
         const structGreyCheck = document.getElementById('structGrey');
         const pmtGreyCheck = document.getElementById('pmtGrey');
@@ -762,18 +977,25 @@ async function init() {
 
         pmtGreyCheck.addEventListener('change', () => {
             const isGrey = pmtGreyCheck.checked;
-            if (isGrey) {
-                pmtMat.color.setHex(0x999999);
-                pmtMat.transmission = 0;
-                pmtMat.roughness = 0.5;
-                pmtMat.metalness = 0.05;
-            } else {
-                pmtMat.color.setHex(0xffffff);
-                pmtMat.transmission = 0.85;
-                pmtMat.roughness = 0.05;
-                pmtMat.metalness = 0.0;
-            }
-            pmtMat.needsUpdate = true;
+            const col = isGrey ? 0x999999 : null;
+            pmtGroup.children.forEach(child => {
+                if (child.isMesh && child.material) {
+                    if (col) {
+                        child.material.color.setHex(col);
+                    } else {
+                        // Restore per-type colour from stored data
+                        const idx = child.userData.pmtIdx;
+                        if (idx !== undefined) {
+                            child.material.color.setHex(PMT_COLORS[pmtData.types[idx]] || 0x999999);
+                        }
+                    }
+                }
+            });
+        });
+
+        const showHWCheck = document.getElementById('showHW');
+        showHWCheck.addEventListener('change', () => {
+            pmtHWGroup.visible = showHWCheck.checked;
         });
 
         // ---- View controls (azimuth, elevation, distance) ----
@@ -873,7 +1095,7 @@ init();
 
 
 def run_server(args):
-    global geometry, n_pmts
+    global geometry, pmt_instance_data
 
     import taichi as ti
 
@@ -882,24 +1104,32 @@ def run_server(args):
     pmt_csv = args.pmt_csv
     if pmt_csv is None:
         pmt_csv = Path("PMTPositions_Scan.txt")
+    else:
+        pmt_csv = Path(pmt_csv)
 
-    print(f"Loading geometry from {args.gdml}...")
+    gdml_path = Path(args.gdml)
+    step_path = Path(args.step) if args.step else None
+    manifest_path = Path(args.manifest) if args.manifest else None
+
+    print(f"Loading geometry from {gdml_path}...")
     geometry = build_geometry(
-        args.gdml,
-        step_path=args.step,
-        manifest_path=args.manifest,
+        gdml_path,
+        step_path=step_path,
+        manifest_path=manifest_path,
         pmt_csv_path=pmt_csv,
         no_lappd=args.no_lappd,
         z_offset=args.z_offset,
         lappd_model=args.lappd_model,
+        bottom_rotation_deg=args.bottom_rot,
     )
     print(f"  Mesh: {geometry.mesh_vertices.shape[0]} verts, {geometry.mesh_triangles.shape[0]} tris")
     print(f"  PMTs: {geometry.pmt_centers.shape[0]}")
-    n_pmts = geometry.pmt_centers.shape[0]
 
     from annieray.pmt_loader import load_pmts
-    pmt_info = load_pmts(pmt_csv, z_offset=args.z_offset)
+    pmt_info = load_pmts(pmt_csv, z_offset=args.z_offset,
+                         bottom_rotation_deg=args.bottom_rot)
     VizHandler._pmt_types = pmt_info["types"]
+    pmt_instance_data = pmt_info
 
     host = args.host
     port = args.port

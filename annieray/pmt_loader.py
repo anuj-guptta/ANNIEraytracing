@@ -1,27 +1,31 @@
 """Load PMT positions from WCSim scan file, mapping to GDML coordinate frame.
 
-Coordinate pipeline (scan → WCSim water-tank frame → structure rest frame):
+Coordinate pipeline (scan → WCBarrel frame → structure rest frame):
 
-  1. Scan file columns (cm):
-       scan_x, scan_y, scan_z
-     WCSim water-tank frame (mm):
-       X_w  = scan_x * 10
-       Y_w  = (168.1 - scan_z) * 10   (beam axis)
-       Z_w  = (scan_y + 14.45) * 10   (vertical)
-     where 168.1 cm = beam centre in scan-Z, 14.45 cm = vertical offset.
+  WCSim's ConstructANNIECylinderScan transforms scan columns (cm):
+       pmt_x, pmt_y, pmt_z
+    into WCBarrel (water volume) coordinates (mm):
+       X_w  = pmt_x * 10
+       Y_w  = (168.1 - pmt_z) * 10   (beam axis)
+       Z_w  = (pmt_y + 14.45) * 10   (vertical)
+    where 168.1 cm = beam centre, 14.45 cm = vertical offset.
 
-  2. The inner structure is placed in the water tank at:
-       rotateZ(157.5°), G4ThreeVector(0, 0, -0.5*WCLength)
-     with WCLength = 3960 mm (WCIDHeight).
-     To get back to structure rest frame (GDML frame):
+  PMTs are placed directly into logicWCBarrel (water volume inside the
+  steel tank). The inner structure GDML is placed in the same water
+  volume with: rotateZ(157.5°), G4ThreeVector(0, 0, -0.5*WCLength).
+  To get back to the structure rest frame (GDML frame):
        P_s = Rz(-157.5°) * P_w + (0, 0, 0.5*WCLength)
 
+  Note: The viz server additionally applies Rx(-90°) at the frontend
+  layer to both the structure mesh and PMT positions so the cylinder
+  axis aligns with Y for display.
+
   3. Direction vectors are generated from the panel_nr / PMT type
-     (matching WCSim's per-face rotation matrices) rather than using
-     the scan file direction columns, which are not used by WCSim.
-     - Bottom PMTs (LUX)   →  (0, 0, 1)   upward
-     - Top PMTs (ETEL)     →  (0, 0, -1)  downward
-     - Barrel PMTs         →  radially inward in the XY plane
+      (matching WCSim's per-face rotation matrices) rather than using
+      the scan file direction columns, which are not used by WCSim.
+      - Bottom PMTs (LUX)   →  (0, 0, 1)   upward
+      - Top PMTs (ETEL)     →  (0, 0, -1)  downward
+      - Barrel PMTs         →  radially inward in the XY plane
 """
 from __future__ import annotations
 
@@ -31,11 +35,11 @@ from pathlib import Path
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# WCSim → tank-frame constants
+# Hall-frame constants (from scan-file metrology)
 # ---------------------------------------------------------------------------
 # Beam centre Z-position in scan coordinates (cm)
 BEAM_CENTER_Z = 168.1  # cm
-# Vertical offset between scan and WCSim frames (cm)
+# Vertical offset between scan and hall frames (cm)
 VERTICAL_OFFSET = 14.45  # cm
 
 # ---------------------------------------------------------------------------
@@ -91,19 +95,57 @@ for pn in range(1, 9):
 for pn in range(1, 9):
     PMT_TYPE_NAMES[(0, pn)] = "Watchboy"
 
+# PMT type → mesh type index for GDML rendering
+# 0: LUX bottom, 1: ETEL top, 2: 8" Hamamatsu, 3: 10" Watchboy/Watchman
+PMT_MESH_TYPE: dict[str, int] = {
+    "LUX": 0,
+    "ETEL": 1,
+    "Hamamatsu": 2,
+    "Watchboy": 3,
+    "Watchman": 3,
+}
+
+# PMT type → rest-pose forward axis (direction from body-center to bulb tip, in GDML mesh frame)
+# LUX/10":  10" R7081, axis ≈ (0155, 0050, 9999) → +Z
+# ETEL:     11" D784KFLB, axis ≈ (-0.0139, -0.0199, -0.9997) → -Z
+# Hamamatsu: 8" R5912, axis ≈ (-0.9998, -0.0019, -0.0210) → +X  (bulb tip at +X)
+# Watch:     10" R7081, mesh recentered at bulb tip (origin). PCA tube axis direction.
+#            offset=0 (bulb tip at origin → instance placed at sphere center)
+PMT_FORWARD: dict[str, tuple[float, float, float]] = {
+    "LUX": (0.0, 0.0, 1.0),
+    "ETEL": (0.0, 0.0, -1.0),
+    "Hamamatsu": (1.0, 0.0, 0.0),
+    "Watchboy": (0.0, 1.0, 0.0),
+    "Watchman": (0.0, 1.0, 0.0),
+}
+
+# PMT type → forward offset (mm from centroid to bulb tip, along forward axis)
+PMT_FORWARD_OFFSET: dict[str, float] = {
+    "LUX": 200.8,
+    "ETEL": 208.3,
+    "Hamamatsu": 145.5,
+    "Watchboy": 193.0,    # centroid → bulb tip along +Y (from STEP mesh measurement)
+    "Watchman": 193.0,    # same
+}
+
 
 def _scan_to_tank(scan_x: float, scan_y: float, scan_z: float
                   ) -> tuple[float, float, float]:
-    """Convert scan coordinates (cm) to WCSim water-tank frame (mm)."""
-    x_w = scan_x * 10.0
-    y_w = (BEAM_CENTER_Z - scan_z) * 10.0
-    z_w = (scan_y + VERTICAL_OFFSET) * 10.0
-    return x_w, y_w, z_w
+    """Convert scan coordinates (cm) to hall frame (mm)."""
+    x_h = scan_x * 10.0
+    y_h = (BEAM_CENTER_Z - scan_z) * 10.0
+    z_h = (scan_y + VERTICAL_OFFSET) * 10.0
+    return x_h, y_h, z_h
 
 
 def _tank_to_structure(x_w: float, y_w: float, z_w: float
                        ) -> tuple[float, float, float]:
-    """Transform from water-tank frame to structure rest frame."""
+    """Transform from WCBarrel (water tank) frame to structure rest frame.
+
+    Undoes the WCSim structure placement: Rz(157.5°) + (0,0,-0.5*WCLength).
+    PMT scan positions (already in WCBarrel frame) map directly to the
+    GDML frame where the structure mesh lives.
+    """
     x_s = x_w * _cos_r - y_w * _sin_r
     y_s = x_w * _sin_r + y_w * _cos_r
     z_s = z_w + HALF_WC_LENGTH
@@ -116,22 +158,29 @@ def _ideal_direction(pmt_type: str, x_s: float, y_s: float
 
     LUX (bottom) → upward (+Z)
     ETEL (top)   → downward (-Z)
-    Barrel types → radially inward in XY plane
+    Barrel types → octagon face inward normal in XY plane
     """
     if pmt_type == "LUX":
         return 0.0, 0.0, 1.0
     if pmt_type == "ETEL":
         return 0.0, 0.0, -1.0
-    # Barrel — radially inward
+    # Barrel — octagon face inward normal (closest of 8 faces)
     r = math.sqrt(x_s * x_s + y_s * y_s)
     if r > 1e-6:
-        return -x_s / r, -y_s / r, 0.0
+        az = math.atan2(y_s, x_s)
+        k = round(az / (math.pi / 4))
+        face_angle = k * math.pi / 4
+        return (-math.cos(face_angle), -math.sin(face_angle), 0.0)
     return 0.0, 0.0, 1.0
 
 
 def load_pmts(scan_path: Path, z_offset: float = 0.0,
               bottom_rotation_deg: float = 0.0) -> dict:
     """Parse WCSim scan file and return PMT data in structure rest frame.
+
+    Pipeline: scan (cm) → hall frame (mm) → structure rest frame.
+    The hall→structure step applies Rx(-90°) (cylinder-axis alignment)
+    then Rz(-157.5°) + (0,0,+1980) (undo WCSim placement).
 
     Args:
         scan_path: Path to PMTPositions_Scan.txt.
@@ -162,8 +211,9 @@ def load_pmts(scan_path: Path, z_offset: float = 0.0,
     type_names = []
     det_nums = []
 
-    # Precompute bottom rotation
-    _brot = math.radians(bottom_rotation_deg)
+    # Precompute bottom rotation (negate: visual alignment requires the
+    # opposite sign from the standard CCW rotation matrix)
+    _brot = -math.radians(bottom_rotation_deg)
     _bcos = math.cos(_brot)
     _bsin = math.sin(_brot)
 
@@ -172,10 +222,10 @@ def load_pmts(scan_path: Path, z_offset: float = 0.0,
         pn = panel_nrs[i]
         pt = pmt_types_code[i]
 
-        # Scan → tank frame
+        # Scan → WCBarrel (water tank) frame
         x_w, y_w, z_w = _scan_to_tank(sx, sy, sz)
 
-        # Tank → structure rest frame
+        # WCBarrel → structure rest frame (undo WCSim placement)
         x_s, y_s, z_s = _tank_to_structure(x_w, y_w, z_w)
 
         # Vertical offset
@@ -201,6 +251,20 @@ def load_pmts(scan_path: Path, z_offset: float = 0.0,
         type_names.append(ptype)
         det_nums.append(int(tube_ids[i]))
 
+    # After the loop, compute per-PMT mesh type index and rotation quaternion
+    mesh_type_indices = np.array([PMT_MESH_TYPE.get(t, 0) for t in type_names], dtype=np.int32)
+    quaternions = np.zeros((n, 4), dtype=np.float32)
+    instance_positions = np.zeros((n, 3), dtype=np.float32)
+
+    for i in range(n):
+        fwd = PMT_FORWARD.get(type_names[i], (0.0, 0.0, 1.0))
+        tgt = directions[i]
+        q = _forward_to_quat(np.array(fwd, dtype=np.float64), tgt)
+        quaternions[i] = q
+        # Shift position backward along direction so bulb tip reaches old center
+        off = PMT_FORWARD_OFFSET.get(type_names[i], 0.0)
+        instance_positions[i] = [centers[i][j] - off * tgt[j] for j in range(3)]
+
     return {
         "centers": centers,
         "radii": radii,
@@ -208,4 +272,32 @@ def load_pmts(scan_path: Path, z_offset: float = 0.0,
         "directions": directions,
         "detector_nums": det_nums,
         "panels": panel_nrs.tolist(),
+        "mesh_types": mesh_type_indices,
+        "quaternions": quaternions,
+        "instance_positions": instance_positions,
     }
+
+
+def _forward_to_quat(forward: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """Return unit quaternion (qx,qy,qz,qw) rotating *forward* onto *target*."""
+    fn = np.linalg.norm(forward)
+    tn = np.linalg.norm(target)
+    if fn < 1e-12 or tn < 1e-12:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    f = forward / fn
+    t = target / tn
+    dot = float(np.clip(f @ t, -1.0, 1.0))
+    if abs(dot - 1.0) < 1e-12:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    if abs(dot + 1.0) < 1e-12:
+        perp = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(f @ perp) > 0.9:
+            perp = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        axis = np.cross(f, perp)
+        axis = axis / np.linalg.norm(axis)
+        return np.array([axis[0], axis[1], axis[2], 0.0], dtype=np.float32)
+    axis = np.cross(f, t)
+    axis = axis / np.linalg.norm(axis)
+    half = math.acos(dot) / 2.0
+    s = math.sin(half)
+    return np.array([axis[0] * s, axis[1] * s, axis[2] * s, math.cos(half)], dtype=np.float32)

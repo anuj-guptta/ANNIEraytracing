@@ -18,11 +18,12 @@ import json
 
 MESH_DIR = Path("pmt_meshes")
 
-# Panel definitions: (label, [(gdml_filename, component_label, color, is_togglable, is_wireframe), ...])
+# Panel definitions: (label, rotatable, [(gdml_filename, component_label, color,
+#                                        is_togglable, is_wireframe), ...])
 # Togglable components get checkboxes; non-togglable ones are always shown.
 PANELS = [
     (
-        '10" barrel PMT',
+        '10" barrel PMT', True,
         [
             ("pmt_10inch_body.gdml",
              "PMT body", "#ff8844", True, False),
@@ -31,7 +32,7 @@ PANELS = [
         ],
     ),
     (
-        '8" barrel PMT',
+        '8" barrel PMT', False,
         [
             ("pmt_8inch_body.gdml",
              "PMT glass", "#44aaff", True, False),
@@ -40,15 +41,15 @@ PANELS = [
         ],
     ),
     (
-        "LUX bottom",
+        "LUX bottom", False,
         [
-            ("pmt_lux_bottom.gdml", "LUX bottom (12 inst)", "#ff66aa", False, False),
+            ("pmt_lux_bottom.gdml", "LUX bottom", "#ff66aa", False, False),
         ],
     ),
     (
-        "ETEL top",
+        "ETEL top", False,
         [
-            ("pmt_etel_top.gdml", "ETEL top (12 inst)", "#aa66ff", False, False),
+            ("pmt_etel_top.gdml", "ETEL top", "#aa66ff", False, False),
         ],
     ),
 ]
@@ -149,8 +150,46 @@ function initPanel(panelIdx) {
   dir2.position.set(-1, -1, 0.5);
   scene.add(dir2);
 
+  // Axes
   const axes = new THREE.AxesHelper(400);
   scene.add(axes);
+
+  // Origin marker
+  const dotGeo = new THREE.SphereGeometry(6, 12, 8);
+  const dotMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+  const dot = new THREE.Mesh(dotGeo, dotMat);
+  dot.position.set(0, 0, 0);
+  scene.add(dot);
+
+  // Axis labels (only on first panel)
+  if (panelIdx === 0) {
+    const axes = [
+      { dir: [1,0,0], label: '+X', color: 0xff4444, pos: [260,0,0] },
+      { dir: [0,1,0], label: '+Y', color: 0x44ff44, pos: [0,260,0] },
+      { dir: [0,0,1], label: '+Z', color: 0x4444ff, pos: [0,0,260] },
+      { dir: [-1,0,0], label: '-X', color: 0x884444, pos: [-260,0,0] },
+      { dir: [0,-1,0], label: '-Y', color: 0x448844, pos: [0,-260,0] },
+      { dir: [0,0,-1], label: '-Z', color: 0x444488, pos: [0,0,-260] },
+    ];
+    for (const a of axes) {
+      const v = new THREE.Vector3(a.dir[0], a.dir[1], a.dir[2]);
+      const arrow = new THREE.ArrowHelper(v, new THREE.Vector3(0,0,0), 200, a.color, 30, 15);
+      scene.add(arrow);
+      const c = document.createElement('canvas');
+      c.width = 80; c.height = 40;
+      const ctx = c.getContext('2d');
+      ctx.font = 'Bold 24px Arial'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#' + a.color.toString(16).padStart(6,'0');
+      ctx.fillText(a.label, 40, 20);
+      const tex = new THREE.CanvasTexture(c);
+      tex.needsUpdate = true;
+      const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+      const sprite = new THREE.Sprite(mat);
+      sprite.position.set(a.pos[0], a.pos[1], a.pos[2]);
+      sprite.scale.set(80, 40, 1);
+      scene.add(sprite);
+    }
+  }
 
   const grid = new THREE.GridHelper(800, 16, 0x666666, 0x444444);
   grid.rotation.x = Math.PI / 2;
@@ -186,8 +225,9 @@ async function main() {
     const p = initPanel(i);
     panels.push(p);
 
-    // Build component meshes
+    // Build component meshes — wrapped in a group for rotation
     const comps = [];
+    const group = new THREE.Group();
     for (const comp of spec.components) {
       const flat = meshCache[comp.gdml];
       const geo = new THREE.BufferGeometry();
@@ -203,9 +243,10 @@ async function main() {
         wireframe: !!comp.wireframe,
       });
       const mesh = new THREE.Mesh(geo, mat);
-      p.scene.add(mesh);
+      group.add(mesh);
       comps.push({ mesh, label: comp.label, togglable: comp.togglable });
     }
+    p.scene.add(group);
 
     // Build controls (checkboxes for togglable components only)
     for (const comp of comps) {
@@ -218,6 +259,50 @@ async function main() {
       labelEl.appendChild(cb);
       labelEl.appendChild(document.createTextNode(' ' + comp.label));
       p.controlsDiv.appendChild(labelEl);
+    }
+
+    // Rotation sliders (for rotatable panels): Y (roll) and Z (tilt)
+    if (spec.rotatable) {
+      for (const axis of ['Y', 'Z']) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:4px;margin:2px 0;';
+
+        const label = document.createElement('span');
+        label.textContent = axis + ':';
+        label.style.cssText = 'width:16px;font-size:11px;color:#aaa;';
+
+        const slider = document.createElement('input');
+        slider.type = 'range';
+        slider.min = -180;
+        slider.max = 180;
+        slider.step = 0.5;
+        slider.value = 0;
+        slider.style.cssText = 'flex:1;min-width:100px;height:16px;';
+
+        const numInput = document.createElement('input');
+        numInput.type = 'number';
+        numInput.min = -180;
+        numInput.max = 180;
+        numInput.step = 0.5;
+        numInput.value = '0';
+        numInput.style.cssText = 'width:52px;font-size:11px;text-align:center;background:#333;color:#ddd;border:1px solid #555;border-radius:3px;';
+
+        const update = (deg) => {
+          deg = Math.max(-180, Math.min(180, deg));
+          group.rotation[axis.toLowerCase()] = deg * Math.PI / 180;
+          slider.value = deg;
+          numInput.value = deg;
+        };
+
+        slider.addEventListener('input', () => update(parseFloat(slider.value)));
+        numInput.addEventListener('change', () => update(parseFloat(numInput.value)));
+        numInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') update(parseFloat(numInput.value)); });
+
+        row.appendChild(label);
+        row.appendChild(slider);
+        row.appendChild(numInput);
+        p.controlsDiv.appendChild(row);
+      }
     }
 
     // Stats
@@ -258,8 +343,12 @@ main();
 </body></html>"""
 
 
-def parse_gdml_flattened(path: Path, recenter=True):
-    """Parse GDML and return flattened float32 array (9 floats per triangle)."""
+def parse_gdml_flattened(path: Path, centroid=None):
+    """Parse GDML and return flattened float32 array (9 floats per triangle).
+    
+    If centroid is given, shift so that centroid becomes the origin.
+    Otherwise compute the mesh's own centroid and center there.
+    """
     tree = ET.parse(path)
     root = tree.getroot()
     positions = root.findall(".//position")
@@ -273,27 +362,39 @@ def parse_gdml_flattened(path: Path, recenter=True):
         for key in ("vertex1", "vertex2", "vertex3"):
             out.extend(verts[tri.attrib[key]])
     arr = np.array(out, dtype=np.float32).reshape(-1, 3)
-    if recenter:
+    if centroid is None:
         centroid = arr.mean(axis=0)
-        arr -= centroid
+    arr -= centroid
     return arr.tobytes()
 
 
-# Verify all files exist and pre-parse
-# body/hardware files are pre-centered at origin; LUX/ETEL need recentering
-RECENTER_FILES = {"pmt_lux_bottom.gdml", "pmt_etel_top.gdml"}
+# GDML files were extracted using extract_barrel_assemblies.py which
+# tessellates ALL components from the STEP file at their STEP positions,
+# then shifts by the combined vertex centroid. Body and hardware files
+# use the SAME shift, so their step-relative positions are preserved.
+# Do NOT recenter — pass centroid=(0,0,0) to keep the extracted positions.
+ZERO = np.array([0.0, 0.0, 0.0])
+ASSEMBLY_CENTROIDS: dict[str, np.ndarray] = {}
+for label, _, components in PANELS:
+    for gdml_name, *_ in components:
+        ASSEMBLY_CENTROIDS[gdml_name] = ZERO
+
+# Pre-parse all meshes. Single-file panels are centered on their own centroid.
+# Multi-file panels use the combined assembly centroid so components stay aligned.
 MESH_CACHE = {}
-for label, components in PANELS:
+for label, _, components in PANELS:
     for gdml_name, comp_label, color, togglable, wireframe in components:
         path = MESH_DIR / gdml_name
         if not path.exists():
             print(f"WARNING: {path} not found!")
             continue
         if gdml_name not in MESH_CACHE:
-            data = parse_gdml_flattened(path, recenter=(gdml_name in RECENTER_FILES))
+            centroid = ASSEMBLY_CENTROIDS.get(gdml_name)
+            data = parse_gdml_flattened(path, centroid=centroid)
             MESH_CACHE[gdml_name] = data
             n_tri = len(data) // 36
-            print(f"  {gdml_name}: {n_tri} triangles")
+            tag = "(assembly)" if gdml_name in ASSEMBLY_CENTROIDS else "(self)"
+            print(f"  {gdml_name}: {n_tri} triangles {tag}")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -306,7 +407,7 @@ class Handler(BaseHTTPRequestHandler):
 
             # Build spec JSON
             spec_list = []
-            for label, components in PANELS:
+            for label, rotatable, components in PANELS:
                 comp_list = []
                 for gdml_name, comp_label, color, togglable, wireframe in components:
                     comp_list.append({
@@ -316,7 +417,8 @@ class Handler(BaseHTTPRequestHandler):
                         "togglable": togglable,
                         "wireframe": wireframe,
                     })
-                spec_list.append({"label": label, "components": comp_list})
+                spec_list.append({"label": label, "rotatable": rotatable,
+                                  "components": comp_list})
 
             html = HTML.replace("%SPECS%", json.dumps(spec_list))
             self.wfile.write(html.encode())
@@ -351,6 +453,7 @@ def main():
     print(f"\nPMT visualizer at http://localhost:{port}")
     print('  4 views: 10" barrel | 8" barrel | LUX bottom | ETEL top')
     print("  Meshes are centered at origin for easier viewing.")
+    print('  10" panel has Z-rotation slider to align PMT axis.')
     print("  Use OrbitControls to pan/zoom/rotate.")
     print("\nPress Ctrl+C to stop.")
     try:

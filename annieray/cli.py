@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-lappd", action="store_true", help="Skip LAPPD rectangles")
     run.add_argument("--z-offset", type=float, default=0.0,
                      help="Vertical offset (mm) — use when PMT CSV and GDML use different Z origins")
-    run.add_argument("--lappd-model", choices=["default", "annie"], default="default",
+    run.add_argument("--lappd-model", choices=["default", "annie"], default="annie",
                      help="LAPPD geometry model (default: bare rectangle; annie: housed LAPPD)")
     run.add_argument("--detector-config", type=Path, default=None,
                      help="Path to detector registry YAML (auto-built if absent)")
@@ -61,8 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
     viz.add_argument("--port", type=int, default=8080, help="Port to bind (default: 8080)")
     viz.add_argument("--no-lappd", action="store_true", help="Skip LAPPD rectangles")
     viz.add_argument("--z-offset", type=float, default=0.0, help="Vertical offset (mm)")
-    viz.add_argument("--lappd-model", choices=["default", "annie"], default="default",
+    viz.add_argument("--lappd-model", choices=["default", "annie"], default="annie",
                      help="LAPPD geometry model (default: bare rectangle; annie: housed LAPPD)")
+    viz.add_argument("--bottom-rot", type=float, default=45.0,
+                     help="Extra Z-rotation (deg) for bottom (panel-0) PMTs only, e.g. 22.5")
 
     detcfg = sub.add_parser("build-detector-config",
                             help="Build detector registry YAML from geometry")
