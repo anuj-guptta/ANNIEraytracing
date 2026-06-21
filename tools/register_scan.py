@@ -196,6 +196,19 @@ def main():
         mesh.export(str(dst))
         print(f"    → {dst}  ({len(mesh.vertices)} verts, {len(mesh.faces)} faces)")
 
+    # Also transform bottom/top PMTs
+    for fname in ["BottomPMTs.ply", "TopPMTs.ply"]:
+        src = SCAN_DIR / fname
+        if not src.exists():
+            continue
+        print(f"  Loading {fname}...")
+        mesh = trimesh.load(str(src))
+        new_verts = apply_transform(np.asarray(mesh.vertices), params)
+        mesh.vertices = new_verts
+        dst = output_dir / fname
+        mesh.export(str(dst))
+        print(f"    → {dst}  ({len(mesh.vertices)} verts, {len(mesh.faces)} faces)")
+
     # Also transform individual panel PMTs
     for i in range(1, 9):
         src = SCAN_DIR / f"Panel-{i}-PMTs.ply"

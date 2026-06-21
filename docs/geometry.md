@@ -241,4 +241,5 @@ z += 109.2
 
 - `tools/register_scan.py` — computes parameters, transforms all PLY files, saves to `scan files by part/transformed/`.
 - `tools/preprocess_scan.py` — converts transformed PLY to `.npy` vertex/triangle arrays for the viz server.
+- `tools/find_pmt_tips.py` — finds PMT bulb tips in the AllPMTs scan mesh using CSV positions as seeds, outputs `pmt_tip_positions.npy`/`.csv`.
 - Viz server serves these arrays via `/api/scan_mesh/{name}/verts` and `/api/scan_mesh/{name}/tris`.
