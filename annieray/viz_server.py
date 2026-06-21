@@ -68,6 +68,21 @@ for _mi, _gn, _rc in [(0, "pmt_lux_bottom.gdml", True),
     else:
         print(f"  PMT mesh {_mi} ({_gn}): NOT FOUND")
 
+# ---- Scan mesh overlay cache ----
+SCAN_MESH_DIR = Path("scan files by part") / "transformed"
+SCAN_MESH_CACHE: dict[str, tuple[bytes, bytes]] = {}  # name -> (verts_bytes, tris_bytes)
+
+def _load_scan_mesh(name: str):
+    """Load a pre-processed scan mesh from .npy files into the cache."""
+    verts_path = SCAN_MESH_DIR / f"{name}_verts.npy"
+    tris_path = SCAN_MESH_DIR / f"{name}_tris.npy"
+    if verts_path.exists() and tris_path.exists():
+        verts = np.load(verts_path).tobytes()
+        tris = np.load(tris_path).tobytes()
+        SCAN_MESH_CACHE[name] = (verts, tris)
+        return True
+    return False
+
 # ---------------------------------------------------------------------------
 
 class VizHandler(BaseHTTPRequestHandler):
@@ -114,6 +129,10 @@ class VizHandler(BaseHTTPRequestHandler):
             self._send_detectors()
         elif path.startswith("/api/pmt_mesh/"):
             self._send_pmt_mesh(path)
+        elif path == "/api/scan_mesh/list":
+            self._send_scan_mesh_list()
+        elif path.startswith("/api/scan_mesh/"):
+            self._send_scan_mesh(path)
         else:
             self.send_error(404)
 
@@ -203,6 +222,29 @@ class VizHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "mesh type not available"}, 404)
             return
         self._send_binary(data)
+
+    def _send_scan_mesh_list(self):
+        names = sorted(SCAN_MESH_CACHE.keys())
+        self._send_json({"meshes": names})
+
+    def _send_scan_mesh(self, path):
+        parts = path.split("/")
+        if len(parts) < 4:
+            self._send_json({"error": "invalid path"}, 400)
+            return
+        mesh_name = parts[-2]
+        data_type = parts[-1]
+        entry = SCAN_MESH_CACHE.get(mesh_name)
+        if entry is None:
+            self._send_json({"error": f"mesh '{mesh_name}' not available"}, 404)
+            return
+        verts_bytes, tris_bytes = entry
+        if data_type == "verts":
+            self._send_binary(verts_bytes)
+        elif data_type == "tris":
+            self._send_binary(tris_bytes)
+        else:
+            self._send_json({"error": "invalid data type"}, 400)
 
     def _handle_trace(self, params):
         try:
@@ -320,7 +362,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <hr style="margin:8px 0;border:none;border-top:1px solid rgba(0,0,0,0.1);">
   <label style="margin-top:6px;"><input type="checkbox" id="structGrey"> Grey Structure</label>
   <label style="margin-top:2px;"><input type="checkbox" id="pmtGrey"> Grey PMTs</label>
+  <label style="margin-top:0;font-size:12px;padding-left:24px;">Opacity <input type="range" id="pmtOpacity" min="0" max="1.0" step="0.01" value="0.85" style="width:100px;"></label>
   <label style="margin-top:2px;"><input type="checkbox" id="showHW"> Show Holders</label>
+  <label style="margin-top:2px;"><input type="checkbox" id="showRefSpheres"> Show Reference Spheres</label>
+  <label style="margin-top:0;font-size:12px;padding-left:24px;">Opacity <input type="range" id="refOpacity" min="0" max="0.5" step="0.01" value="0.12" style="width:100px;"></label>
+  <label style="margin-top:2px;"><input type="checkbox" id="showScan"> Show Scan Overlay</label>
+  <label style="margin-top:0;font-size:12px;padding-left:24px;">
+    Mesh <select id="scanMeshSelect" style="font-size:11px;">
+      <option value="SuperStructure">SuperStructure</option>
+      <option value="AllPMTs">All PMTs</option>
+      <option value="BottomLayer">Bottom Layer</option>
+      <option value="TopLayer">Top Layer</option>
+    </select>
+  </label>
   <label style="margin-top:2px;"><input type="checkbox" id="showCone" checked> Show Cone Guide</label>
   <label style="margin-top:2px;"><input type="checkbox" id="showRayLines"> Show Ray Lines</label>
   <button id="traceBtn" style="margin-top:8px;">Trace Cherenkov Photons</button>
@@ -360,6 +414,8 @@ let housingData = null;
 let boxMesh = null;
 let tracePoints = null;   // group of dot meshes for traced photon hits
 let rayLines = null;      // group of line meshes for sampled ray paths
+let refSpheres = null;    // group of translucent reference spheres
+let scanOverlay = null;   // group for scan mesh overlay
 let traceResultEl = null;
 
 // ---- DOM refs ----
@@ -857,10 +913,78 @@ async function init() {
             const origin = new THREE.Vector3(c[0], c[1], c[2]);
             const arrow = new THREE.ArrowHelper(dir, origin, 50, color, 18, 10);
             pmtGroup.add(arrow);
+
+            // Red dot at bulb tip (centers[i]) for alignment debugging
+            const dotGeo = new THREE.SphereGeometry(6, 8, 6);
+            const dotMat = new THREE.MeshBasicMaterial({ color: 0xff0000 });
+            const dot = new THREE.Mesh(dotGeo, dotMat);
+            dot.position.set(c[0], c[1], c[2]);
+            pmtGroup.add(dot);
         }
         scene.add(pmtGroup);
         pmtHWGroup.visible = false;
         scene.add(pmtHWGroup);
+
+        // Reference spheres at each PMT center+radius (translucent)
+        refSpheres = new THREE.Group();
+        for (let i = 0; i < pmtData.centers.length; i++) {
+            const c = pmtData.centers[i];
+            const r = pmtData.radii[i];
+            const type = pmtData.types[i];
+            const color = PMT_COLORS[type] || 0x999999;
+            const sphereGeo = new THREE.SphereGeometry(r, 32, 24);
+            const sphereMat = new THREE.MeshPhysicalMaterial({
+                color: color,
+                transparent: true,
+                opacity: 0.12,
+                roughness: 0.0,
+                metalness: 0.0,
+                depthWrite: false,
+                side: THREE.DoubleSide,
+            });
+            const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+            sphere.position.set(c[0], c[1], c[2]);
+            refSpheres.add(sphere);
+        }
+        refSpheres.visible = false;
+        scene.add(refSpheres);
+
+        // Scan overlay (loaded on demand)
+        scanOverlay = new THREE.Group();
+        scanOverlay.visible = false;
+        scene.add(scanOverlay);
+
+        async function loadScanMesh(name) {
+            const [vertsResp, trisResp] = await Promise.all([
+                fetch(`/api/scan_mesh/${name}/verts`),
+                fetch(`/api/scan_mesh/${name}/tris`),
+            ]);
+            if (!vertsResp.ok || !trisResp.ok) return null;
+            const vertsBuf = await vertsResp.arrayBuffer();
+            const trisBuf = await trisResp.arrayBuffer();
+            const positions = new Float32Array(vertsBuf);
+            const indices = new Int32Array(trisBuf);
+            const geo = new THREE.BufferGeometry();
+            geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geo.setIndex(new THREE.BufferAttribute(indices, 1));
+            // Flatten indexed to non-indexed (indexed path has rendering issues)
+            const pos = geo.getAttribute('position');
+            const idx = geo.getIndex();
+            const triCount = idx.count / 3;
+            const flatPos = new Float32Array(triCount * 9);
+            for (let i = 0; i < triCount; i++) {
+                for (let j = 0; j < 3; j++) {
+                    const vi = idx.getX(i * 3 + j);
+                    flatPos[i * 9 + j * 3 + 0] = pos.getX(vi);
+                    flatPos[i * 9 + j * 3 + 1] = pos.getY(vi);
+                    flatPos[i * 9 + j * 3 + 2] = pos.getZ(vi);
+                }
+            }
+            const flatGeo = new THREE.BufferGeometry();
+            flatGeo.setAttribute('position', new THREE.BufferAttribute(flatPos, 3));
+            flatGeo.computeVertexNormals();
+            return flatGeo;
+        }
 
         statusEl.textContent = `Loaded ${pmtData.centers.length} PMTs.`;
 
@@ -998,6 +1122,94 @@ async function init() {
             pmtHWGroup.visible = showHWCheck.checked;
         });
 
+        const showRefCheck = document.getElementById('showRefSpheres');
+        showRefCheck.addEventListener('change', () => {
+            refSpheres.visible = showRefCheck.checked;
+        });
+
+        const refOpacitySlider = document.getElementById('refOpacity');
+        refOpacitySlider.addEventListener('input', () => {
+            const op = parseFloat(refOpacitySlider.value);
+            refSpheres.children.forEach(child => {
+                if (child.isMesh && child.material) {
+                    child.material.opacity = op;
+                }
+            });
+        });
+
+        const showScanCheck = document.getElementById('showScan');
+        const scanMeshSelect = document.getElementById('scanMeshSelect');
+        let scanLoadedName = '';
+
+        async function loadScanOverlay(name) {
+            statusEl.textContent = `Loading ${name}…`;
+            const geo = await loadScanMesh(name);
+            if (!geo) {
+                statusEl.textContent = `Scan mesh '${name}' not available.`;
+                return null;
+            }
+            const box = new THREE.Box3().setFromBufferAttribute(geo.getAttribute('position'));
+            console.log(`Scan mesh '${name}' bounds:`, box.min.toArray(), box.max.toArray());
+            const mat = new THREE.MeshPhysicalMaterial({
+                color: 0xff8844,
+                roughness: 0.5,
+                metalness: 0.0,
+                transparent: true,
+                opacity: 0.65,
+                side: THREE.DoubleSide,
+                depthWrite: true,
+            });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.castShadow = false;
+            mesh.receiveShadow = false;
+            scanOverlay.add(mesh);
+            scanLoadedName = name;
+            statusEl.textContent = `Scan overlay '${name}' loaded.`;
+            return mesh;
+        }
+
+        showScanCheck.addEventListener('change', async () => {
+            if (showScanCheck.checked) {
+                if (scanOverlay.children.length === 0) {
+                    await loadScanOverlay(scanMeshSelect.value);
+                }
+                scanOverlay.visible = true;
+            } else {
+                scanOverlay.visible = false;
+            }
+        });
+
+        scanMeshSelect.addEventListener('change', async () => {
+            const name = scanMeshSelect.value;
+            // Clear current mesh
+            while (scanOverlay.children.length > 0) {
+                const child = scanOverlay.children[0];
+                child.geometry.dispose();
+                child.material.dispose();
+                scanOverlay.remove(child);
+            }
+            scanLoadedName = '';
+            if (showScanCheck.checked) {
+                await loadScanOverlay(name);
+                scanOverlay.visible = true;
+            }
+        });
+
+        const pmtOpacitySlider = document.getElementById('pmtOpacity');
+        pmtOpacitySlider.addEventListener('input', () => {
+            const op = parseFloat(pmtOpacitySlider.value);
+            pmtGroup.children.forEach(child => {
+                if (child.isMesh && child.material) {
+                    child.material.opacity = op;
+                }
+            });
+            pmtHWGroup.children.forEach(child => {
+                if (child.isMesh && child.material) {
+                    child.material.opacity = op;
+                }
+            });
+        });
+
         // ---- View controls (azimuth, elevation, distance) ----
         const viewAzSlider = document.getElementById('viewAz');
         const viewElSlider = document.getElementById('viewEl');
@@ -1130,6 +1342,13 @@ def run_server(args):
                          bottom_rotation_deg=args.bottom_rot)
     VizHandler._pmt_types = pmt_info["types"]
     pmt_instance_data = pmt_info
+
+    # Load scan mesh overlays
+    print("Loading scan overlays...")
+    for _sn in ["AllPMTs", "SuperStructure", "BottomLayer", "TopLayer"]:
+        if _load_scan_mesh(_sn):
+            _n = len(np.load(SCAN_MESH_DIR / f"{_sn}_verts.npy"))
+            print(f"  Scan mesh '{_sn}': {_n} verts")
 
     host = args.host
     port = args.port

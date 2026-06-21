@@ -121,8 +121,8 @@ PMT_FORWARD: dict[str, tuple[float, float, float]] = {
 
 # PMT type → forward offset (mm from centroid to bulb tip, along forward axis)
 PMT_FORWARD_OFFSET: dict[str, float] = {
-    "LUX": 200.8,
-    "ETEL": 208.3,
+    "LUX": 172.7,    # centroid → bulb tip along +Z (triangle-soup centroid)
+    "ETEL": 174.7,   # centroid → bulb tip along -Z (triangle-soup centroid)
     "Hamamatsu": 145.5,
     "Watchboy": 193.0,    # centroid → bulb tip along +Y (from STEP mesh measurement)
     "Watchman": 193.0,    # same
@@ -261,9 +261,10 @@ def load_pmts(scan_path: Path, z_offset: float = 0.0,
         tgt = directions[i]
         q = _forward_to_quat(np.array(fwd, dtype=np.float64), tgt)
         quaternions[i] = q
-        # Shift position backward along direction so bulb tip reaches old center
+        # Shift position so bulb tip is at sphere surface (center + radius * direction)
         off = PMT_FORWARD_OFFSET.get(type_names[i], 0.0)
-        instance_positions[i] = [centers[i][j] - off * tgt[j] for j in range(3)]
+        r = radii[i]
+        instance_positions[i] = [centers[i][j] + (r - off) * tgt[j] for j in range(3)]
 
     return {
         "centers": centers,
