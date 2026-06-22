@@ -10,6 +10,7 @@ Usage:
 
 from __future__ import annotations
 
+import csv
 import json
 import time
 import xml.etree.ElementTree as ET
@@ -68,6 +69,9 @@ for _mi, _gn, _rc in [(0, "pmt_lux_bottom.gdml", True),
     else:
         print(f"  PMT mesh {_mi} ({_gn}): NOT FOUND")
 
+# ---- PMT tip positions cache ----
+PMT_TIPS_CACHE: list[dict] | None = None  # loaded from pmt_tip_positions.csv
+
 # ---- Scan mesh overlay cache ----
 SCAN_MESH_DIR = Path("scan files by part") / "transformed"
 SCAN_MESH_CACHE: dict[str, tuple[bytes, bytes]] = {}  # name -> (verts_bytes, tris_bytes)
@@ -87,6 +91,9 @@ def _load_scan_mesh(name: str):
 
 class VizHandler(BaseHTTPRequestHandler):
     _pmt_types: list[str] = []
+    _pmt_data = None
+    _corrections: dict[int, tuple[float, float, float]] = {}
+    _corr_path: Path | None = None
 
     def log_message(self, fmt, *args):
         pass  # quiet
@@ -133,8 +140,90 @@ class VizHandler(BaseHTTPRequestHandler):
             self._send_scan_mesh_list()
         elif path.startswith("/api/scan_mesh/"):
             self._send_scan_mesh(path)
+        elif path == "/api/pmt_tips":
+            self._send_pmt_tips()
         else:
             self.send_error(404)
+
+    def do_POST(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        data = json.loads(body)
+        path = urlparse(self.path).path
+
+        if path == "/api/correction/save":
+            self._save_correction(data)
+        else:
+            self.send_error(404)
+
+    def _save_correction(self, data):
+        tube_id = int(data["tube_id"])
+        axial = float(data["axial"])
+        tangential = float(data["tangential"])
+        vertical = float(data["vertical"])
+
+        dets = list(self._pmt_data["detector_nums"])
+        if tube_id not in dets:
+            self._send_json({"error": "tube not found"}, 400)
+            return
+        idx = dets.index(tube_id)
+        d = self._pmt_data["directions"][idx]
+
+        # Determine mode from direction
+        if abs(d[2]) > 0.99:  # bottom or top PMT — global XYZ
+            dx, dy, dz = axial, tangential, vertical
+        else:  # barrel PMT — local axis basis
+            e_axial = np.array([d[0], d[1], d[2]], dtype=np.float64)
+            e_vertical = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            e_tangential = np.cross(e_vertical, e_axial)
+            tnorm = np.linalg.norm(e_tangential)
+            if tnorm > 1e-9:
+                e_tangential /= tnorm
+            else:
+                e_tangential = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            dx = axial * e_axial[0] + tangential * e_tangential[0] + vertical * e_vertical[0]
+            dy = axial * e_axial[1] + tangential * e_tangential[1] + vertical * e_vertical[1]
+            dz = axial * e_axial[2] + tangential * e_tangential[2] + vertical * e_vertical[2]
+
+        # Read current file
+        corrections = {}
+        corr_path = self._corr_path
+        if corr_path and corr_path.exists():
+            with open(corr_path, newline="") as f:
+                for row in csv.DictReader(f):
+                    corrections[int(row["tube_id"])] = (
+                        float(row.get("dx", 0)),
+                        float(row.get("dy", 0)),
+                        float(row.get("dz", 0)),
+                    )
+
+        old = corrections.get(tube_id, (0.0, 0.0, 0.0))
+
+        # Update in-memory
+        corrections[tube_id] = (dx, dy, dz)
+        self._corrections[tube_id] = (dx, dy, dz)
+
+        # Write back
+        with open(corr_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["tube_id", "dx", "dy", "dz"])
+            for tid in sorted(corrections):
+                cx, cy, cz = corrections[tid]
+                writer.writerow([tid, cx, cy, cz])
+
+        # Apply delta to instance_positions
+        positions = self._pmt_data["instance_positions"]
+        positions[idx, 0] += dx - old[0]
+        positions[idx, 1] += dy - old[1]
+        positions[idx, 2] += dz - old[2]
+
+        self._send_json({
+            "success": True,
+            "tube_id": tube_id,
+            "instance_position": [float(positions[idx, 0]),
+                                  float(positions[idx, 1]),
+                                  float(positions[idx, 2])],
+        })
 
     def _send_lappd_housing(self):
         if geometry.lappd_housing_data.shape[0] == 0:
@@ -184,6 +273,8 @@ class VizHandler(BaseHTTPRequestHandler):
             "radii": geometry.pmt_radii.tolist(),
             "types": self._pmt_types,
             "directions": d.tolist(),
+            "detector_nums": pmt_instance_data["detector_nums"] if pmt_instance_data is not None else [],
+            "corrections": {str(tid): list(v) for tid, v in self._corrections.items()},
         }
         if pmt_instance_data is not None:
             resp["mesh_types"] = pmt_instance_data["mesh_types"].tolist()
@@ -245,6 +336,12 @@ class VizHandler(BaseHTTPRequestHandler):
             self._send_binary(tris_bytes)
         else:
             self._send_json({"error": "invalid data type"}, 400)
+
+    def _send_pmt_tips(self):
+        if PMT_TIPS_CACHE is None:
+            self._send_json({"tips": []})
+            return
+        self._send_json({"tips": PMT_TIPS_CACHE})
 
     def _handle_trace(self, params):
         try:
@@ -335,6 +432,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .hit-summary { display:grid; grid-template-columns:1fr 1fr; gap:2px 12px; }
   .hit-summary .label { color:#666; }
   .hit-summary .value { text-align:right; color:#000; }
+  #pmt-adjust {
+    display:none; position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
+    background:rgba(240,242,245,0.95); color:#333; padding:12px 20px;
+    border-radius:8px; font-size:13px; z-index:200; min-width:340px;
+    text-align:center; backdrop-filter:blur(4px);
+    border:1px solid rgba(0,0,0,0.12); box-shadow:0 4px 20px rgba(0,0,0,0.15);
+  }
+  #pmt-adjust .adj-row { display:flex; align-items:center; gap:8px; margin:4px 0; justify-content:center; }
+  #pmt-adjust .adj-row label { min-width:80px; text-align:right; }
+  #pmt-adjust .adj-row input[type=range] { width:140px; margin:0; accent-color:#4488cc; }
+  #pmt-adjust .adj-row .val { min-width:50px; text-align:left; font-family:monospace; }
+  #pmt-adjust button {
+    margin:6px 4px 0; padding:5px 16px; border:none; border-radius:4px; font-size:12px; cursor:pointer;
+  }
+  #pmt-adjust #adj-save { background:#4488cc; color:#fff; }
+  #pmt-adjust #adj-save:hover { background:#5599dd; }
+  #pmt-adjust #adj-reset { background:#888; color:#fff; }
+  #pmt-adjust #adj-reset:hover { background:#999; }
+  #pmt-adjust #adj-cancel { background:#ccc; color:#333; }
+  #pmt-adjust #adj-cancel:hover { background:#ddd; }
 </style>
 </head>
 <body>
@@ -361,11 +478,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <label style="margin-top:6px;"><input type="checkbox" id="lappdGrey"> Grey LAPPD</label>
   <hr style="margin:8px 0;border:none;border-top:1px solid rgba(0,0,0,0.1);">
   <label style="margin-top:6px;"><input type="checkbox" id="structGrey"> Grey Structure</label>
+  <label style="margin-top:0;font-size:12px;padding-left:24px;">Opacity <input type="range" id="structOpacity" min="0" max="1.0" step="0.01" value="1.0" style="width:100px;"></label>
   <label style="margin-top:2px;"><input type="checkbox" id="pmtGrey"> Grey PMTs</label>
   <label style="margin-top:0;font-size:12px;padding-left:24px;">Opacity <input type="range" id="pmtOpacity" min="0" max="1.0" step="0.01" value="0.85" style="width:100px;"></label>
   <label style="margin-top:2px;"><input type="checkbox" id="showHW"> Show Holders</label>
   <label style="margin-top:2px;"><input type="checkbox" id="showRefSpheres"> Show Reference Spheres</label>
   <label style="margin-top:0;font-size:12px;padding-left:24px;">Opacity <input type="range" id="refOpacity" min="0" max="0.5" step="0.01" value="0.12" style="width:100px;"></label>
+  <label style="margin-top:2px;"><input type="checkbox" id="showTubeIDs"> Show Tube IDs</label>
   <label style="margin-top:2px;"><input type="checkbox" id="showScan"> Show Scan Overlay</label>
   <label style="margin-top:0;font-size:12px;padding-left:24px;">
     Mesh <select id="scanMeshSelect" style="font-size:11px;">
@@ -373,8 +492,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <option value="AllPMTs">All PMTs</option>
       <option value="BottomLayer">Bottom Layer</option>
       <option value="TopLayer">Top Layer</option>
+      <option value="Panel-1">Panel 1</option>
+      <option value="Panel-2">Panel 2</option>
+      <option value="Panel-3">Panel 3</option>
+      <option value="Panel-4">Panel 4</option>
+      <option value="Panel-5">Panel 5</option>
+      <option value="Panel-6">Panel 6</option>
+      <option value="Panel-7">Panel 7</option>
+      <option value="Panel-8">Panel 8</option>
+      <option value="Panel-1-PMTs">Panel 1 PMTs</option>
+      <option value="Panel-2-PMTs">Panel 2 PMTs</option>
+      <option value="Panel-3-PMTs">Panel 3 PMTs</option>
+      <option value="Panel-4-PMTs">Panel 4 PMTs</option>
+      <option value="Panel-5-PMTs">Panel 5 PMTs</option>
+      <option value="Panel-6-PMTs">Panel 6 PMTs</option>
+      <option value="Panel-7-PMTs">Panel 7 PMTs</option>
+      <option value="Panel-8-PMTs">Panel 8 PMTs</option>
+      <option value="TopPMTs">Top PMTs</option>
+      <option value="BottomPMTs">Bottom PMTs</option>
+      <option value="TankLid">Tank Lid</option>
     </select>
   </label>
+  <label style="margin-top:2px;"><input type="checkbox" id="showScanTips"> Show Scan Tips</label>
   <label style="margin-top:2px;"><input type="checkbox" id="showCone" checked> Show Cone Guide</label>
   <label style="margin-top:2px;"><input type="checkbox" id="showRayLines"> Show Ray Lines</label>
   <button id="traceBtn" style="margin-top:8px;">Trace Cherenkov Photons</button>
@@ -391,6 +530,31 @@ HTML_PAGE = r"""<!DOCTYPE html>
 </div>
 <div id="status">Loading geometry…</div>
 <div id="info">Drag to orbit · Scroll to zoom · Right-drag to pan</div>
+<div id="pmt-adjust">
+  <div style="margin-bottom:6px;"><b>PMT <span id="adj-tube-id"></span></b> <span id="adj-type" style="color:#888;font-size:11px;"></span></div>
+  <div id="adj-sliders">
+    <div class="adj-row">
+      <label id="adj-label-0">Axial</label>
+      <input type="range" id="adj-0" min="-100" max="100" step="0.1" value="0">
+      <span class="val" id="adj-val-0">0.0</span> mm
+    </div>
+    <div class="adj-row">
+      <label id="adj-label-1">Tangential</label>
+      <input type="range" id="adj-1" min="-100" max="100" step="0.1" value="0">
+      <span class="val" id="adj-val-1">0.0</span> mm
+    </div>
+    <div class="adj-row">
+      <label id="adj-label-2">Vertical</label>
+      <input type="range" id="adj-2" min="-100" max="100" step="0.1" value="0">
+      <span class="val" id="adj-val-2">0.0</span> mm
+    </div>
+  </div>
+  <div style="margin-top:4px;">
+    <button id="adj-save">Save</button>
+    <button id="adj-reset">Reset</button>
+    <button id="adj-cancel">Cancel</button>
+  </div>
+</div>
 
 <script type="importmap">
 {
@@ -417,6 +581,11 @@ let rayLines = null;      // group of line meshes for sampled ray paths
 let refSpheres = null;    // group of translucent reference spheres
 let scanOverlay = null;   // group for scan mesh overlay
 let traceResultEl = null;
+let pmtGroup = null;      // group of PMT body meshes
+let pmtHWGroup = null;    // group of PMT holder meshes
+let pmtData = null;       // full PMT data from /api/pmts
+let selectedIdx = -1;     // index of selected PMT, -1 = none
+let selectedMesh = null;  // the mesh object currently highlighted
 
 // ---- DOM refs ----
 const statusEl = document.getElementById('status');
@@ -794,6 +963,8 @@ async function init() {
             color: 0xffffff,
             roughness: 0.5,
             metalness: 0.05,
+            transparent: true,
+            opacity: 1.0,
             side: THREE.DoubleSide,
         });
         const mesh = new THREE.Mesh(flatGeo, meshMat);
@@ -841,8 +1012,8 @@ async function init() {
         }
 
         // Render PMTs
-        const pmtGroup = new THREE.Group();
-        const pmtHWGroup = new THREE.Group();
+        pmtGroup = new THREE.Group();
+        pmtHWGroup = new THREE.Group();
         for (let i = 0; i < pmtData.centers.length; i++) {
             const c = pmtData.centers[i];
             const r = pmtData.radii[i];
@@ -870,6 +1041,7 @@ async function init() {
                 mesh.castShadow = true;
                 mesh.receiveShadow = true;
                 mesh.userData.pmtIdx = i;
+                mesh.userData.tubeId = pmtData.detector_nums[i];
                 pmtGroup.add(mesh);
 
                 // Hardware mesh at same position/orientation
@@ -890,6 +1062,7 @@ async function init() {
                     hwMesh.castShadow = true;
                     hwMesh.receiveShadow = true;
                     hwMesh.userData.pmtIdx = i;
+                    hwMesh.userData.tubeId = pmtData.detector_nums[i];
                     pmtHWGroup.add(hwMesh);
                 }
             } else {
@@ -906,6 +1079,7 @@ async function init() {
                 sphere.castShadow = true;
                 sphere.receiveShadow = true;
                 sphere.userData.pmtIdx = i;
+                sphere.userData.tubeId = pmtData.detector_nums[i];
                 pmtGroup.add(sphere);
             }
 
@@ -924,6 +1098,36 @@ async function init() {
         scene.add(pmtGroup);
         pmtHWGroup.visible = false;
         scene.add(pmtHWGroup);
+
+        // ---- Tube ID labels ----
+        const labelGroup = new THREE.Group();
+        labelGroup.visible = false;
+        for (let i = 0; i < pmtData.centers.length; i++) {
+            const c = pmtData.centers[i];
+            const tid = pmtData.detector_nums[i];
+            const canvas = document.createElement('canvas');
+            canvas.width = 192;
+            canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = 'rgba(0,0,0,0.55)';
+            ctx.beginPath();
+            ctx.roundRect(0, 0, 192, 64, 8);
+            ctx.fill();
+            ctx.font = 'bold 28px monospace';
+            ctx.fillStyle = '#fff';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(String(tid), 96, 34);
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.needsUpdate = true;
+            const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, sizeAttenuation: true });
+            const sprite = new THREE.Sprite(mat);
+            sprite.position.set(c[0], c[1], c[2] + 200);
+            sprite.scale.set(400, 140, 1);
+            sprite.userData.pmtIdx = i;
+            labelGroup.add(sprite);
+        }
+        scene.add(labelGroup);
 
         // Reference spheres at each PMT center+radius (translucent)
         refSpheres = new THREE.Group();
@@ -1099,6 +1303,11 @@ async function init() {
             meshMat.color.setHex(structGreyCheck.checked ? 0x999999 : 0xffffff);
         });
 
+        const structOpacitySlider = document.getElementById('structOpacity');
+        structOpacitySlider.addEventListener('input', () => {
+            meshMat.opacity = parseFloat(structOpacitySlider.value);
+        });
+
         pmtGreyCheck.addEventListener('change', () => {
             const isGrey = pmtGreyCheck.checked;
             const col = isGrey ? 0x999999 : null;
@@ -1137,6 +1346,11 @@ async function init() {
             });
         });
 
+        const showTubeIDsCheck = document.getElementById('showTubeIDs');
+        showTubeIDsCheck.addEventListener('change', () => {
+            labelGroup.visible = showTubeIDsCheck.checked;
+        });
+
         const showScanCheck = document.getElementById('showScan');
         const scanMeshSelect = document.getElementById('scanMeshSelect');
         let scanLoadedName = '';
@@ -1151,7 +1365,7 @@ async function init() {
             const box = new THREE.Box3().setFromBufferAttribute(geo.getAttribute('position'));
             console.log(`Scan mesh '${name}' bounds:`, box.min.toArray(), box.max.toArray());
             const mat = new THREE.MeshPhysicalMaterial({
-                color: 0xff8844,
+                color: 0x44aadd,
                 roughness: 0.5,
                 metalness: 0.0,
                 transparent: true,
@@ -1194,6 +1408,47 @@ async function init() {
                 scanOverlay.visible = true;
             }
         });
+
+        // ---- PMT Scan Tips ----
+        let pmtTips = null;
+        const showScanTipsCheck = document.getElementById('showScanTips');
+        showScanTipsCheck.addEventListener('change', () => {
+            if (pmtTips) pmtTips.visible = showScanTipsCheck.checked;
+        });
+
+        async function loadPmtTips() {
+            const resp = await fetch('/api/pmt_tips');
+            const data = await resp.json();
+            if (!data.tips || data.tips.length === 0) return;
+
+            const tipGroup = new THREE.Group();
+            const highMat = new THREE.MeshBasicMaterial({ color: 0x44dd44 });
+            const medMat = new THREE.MeshBasicMaterial({ color: 0xdddd44 });
+            const lowMat = new THREE.MeshBasicMaterial({ color: 0xdd4444 });
+
+            for (const t of data.tips) {
+                if (!t.found) continue;
+                const r = t.reliability;
+                const mat = r >= 0.7 ? highMat : r >= 0.3 ? medMat : lowMat;
+                const geo = new THREE.SphereGeometry(8, 8, 6);
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.position.set(t.tip_x, t.tip_y, t.tip_z);
+                tipGroup.add(mesh);
+
+                // CSV seed position (smaller yellow dot)
+                const csvGeo = new THREE.SphereGeometry(4, 6, 4);
+                const csvMat = new THREE.MeshBasicMaterial({ color: 0xdddd00 });
+                const csvMesh = new THREE.Mesh(csvGeo, csvMat);
+                csvMesh.position.set(t.csv_x, t.csv_y, t.csv_z);
+                tipGroup.add(csvMesh);
+            }
+
+            tipGroup.visible = showScanTipsCheck.checked;
+            scene.add(tipGroup);
+            pmtTips = tipGroup;
+            statusEl.textContent += ` ${data.tips.length} tips loaded.`;
+        }
+        loadPmtTips();
 
         const pmtOpacitySlider = document.getElementById('pmtOpacity');
         pmtOpacitySlider.addEventListener('input', () => {
@@ -1271,6 +1526,223 @@ async function init() {
         }
         animate();
 
+        // ---- PMT click selection ----
+        const raycaster = new THREE.Raycaster();
+        const pointer = new THREE.Vector2();
+        const adjPanel = document.getElementById('pmt-adjust');
+        let meshStartPos = null;
+        let selectedStartSliders = null;
+        let adjBasis = null;
+
+        function sliderToCartesian(vals, basis) {
+            if (basis.mode === 'global') {
+                return new THREE.Vector3(vals[0], vals[1], vals[2]);
+            }
+            const a = vals[0], t = vals[1], v = vals[2];
+            return new THREE.Vector3(
+                a * basis.eAxial.x + t * basis.eTang.x + v * basis.eVert.x,
+                a * basis.eAxial.y + t * basis.eTang.y + v * basis.eVert.y,
+                a * basis.eAxial.z + t * basis.eTang.z + v * basis.eVert.z
+            );
+        }
+
+        function updatePMTPreview() {
+            if (selectedIdx < 0 || !adjBasis || !meshStartPos || !selectedStartSliders) return;
+            const vals = [
+                parseFloat(document.getElementById('adj-0').value),
+                parseFloat(document.getElementById('adj-1').value),
+                parseFloat(document.getElementById('adj-2').value),
+            ];
+            const currentCorr = sliderToCartesian(vals, adjBasis);
+            const startCorr = sliderToCartesian(selectedStartSliders, adjBasis);
+            const delta = currentCorr.clone().sub(startCorr);
+            const newPos = meshStartPos.clone().add(delta);
+            pmtGroup.children.forEach(ch => {
+                if (ch.userData && ch.userData.pmtIdx === selectedIdx) {
+                    ch.position.copy(newPos);
+                }
+            });
+            pmtHWGroup.children.forEach(ch => {
+                if (ch.userData && ch.userData.pmtIdx === selectedIdx) {
+                    ch.position.copy(newPos);
+                }
+            });
+        }
+
+        function cancelAdjustment() {
+            if (selectedMesh && meshStartPos) {
+                pmtGroup.children.forEach(ch => {
+                    if (ch.userData && ch.userData.pmtIdx === selectedIdx) {
+                        ch.position.copy(meshStartPos);
+                    }
+                });
+                pmtHWGroup.children.forEach(ch => {
+                    if (ch.userData && ch.userData.pmtIdx === selectedIdx) {
+                        ch.position.copy(meshStartPos);
+                    }
+                });
+            }
+            deselectPMT();
+        }
+
+        function deselectPMT() {
+            if (selectedMesh) {
+                selectedMesh.material.emissive.setHex(0x000000);
+                selectedMesh.material.emissiveIntensity = 0;
+            }
+            selectedIdx = -1;
+            selectedMesh = null;
+            adjPanel.style.display = 'none';
+            meshStartPos = null;
+            selectedStartSliders = null;
+            adjBasis = null;
+        }
+
+        function selectPMT(idx) {
+            if (selectedMesh) {
+                selectedMesh.material.emissive.setHex(0x000000);
+                selectedMesh.material.emissiveIntensity = 0;
+            }
+            selectedIdx = idx;
+            selectedMesh = null;
+            const tubeId = pmtData.detector_nums[idx];
+            const type = pmtData.types[idx];
+            const dir = pmtData.directions[idx];
+            const corr = pmtData.corrections[tubeId] || [0, 0, 0];
+
+            document.getElementById('adj-tube-id').textContent = tubeId;
+            document.getElementById('adj-type').textContent = type;
+            adjPanel.style.display = 'block';
+
+            // Compute basis and initial slider values
+            let v0, v1, v2, labels;
+            const eVert = new THREE.Vector3(0, 0, 1);
+            const eAxial = new THREE.Vector3(dir[0], dir[1], dir[2]);
+            const eTang = new THREE.Vector3().crossVectors(eVert, eAxial);
+            const tLen = eTang.length();
+            let mode;
+
+            if (tLen < 1e-6) {  // bottom/top — global XYZ
+                mode = 'global';
+                labels = ['dX', 'dY', 'dZ'];
+                v0 = corr[0]; v1 = corr[1]; v2 = corr[2];
+            } else {
+                mode = 'local';
+                eTang.divideScalar(tLen);
+                labels = ['Axial', 'Tangential', 'Vertical'];
+                v0 = corr[0]*eAxial.x + corr[1]*eAxial.y + corr[2]*eAxial.z;
+                v1 = corr[0]*eTang.x  + corr[1]*eTang.y  + corr[2]*eTang.z;
+                v2 = corr[2];  // dot with (0,0,1)
+            }
+
+            for (let k = 0; k < 3; k++) {
+                document.getElementById('adj-label-' + k).textContent = labels[k];
+                const sl = document.getElementById('adj-' + k);
+                const vals = [v0, v1, v2];
+                sl.value = vals[k];
+                document.getElementById('adj-val-' + k).textContent = parseFloat(vals[k]).toFixed(1);
+            }
+
+            // Highlight the clicked mesh — find a mesh belonging to this PMT
+            const allMeshes = [];
+            pmtGroup.children.forEach(ch => { if (ch.userData && ch.userData.pmtIdx === idx) allMeshes.push(ch); });
+            pmtHWGroup.children.forEach(ch => { if (ch.userData && ch.userData.pmtIdx === idx) allMeshes.push(ch); });
+            if (allMeshes.length > 0) {
+                selectedMesh = allMeshes[0];
+                selectedMesh.material.emissive.setHex(0x4444ff);
+                selectedMesh.material.emissiveIntensity = 0.5;
+            }
+
+            // Record start state for preview
+            meshStartPos = selectedMesh ? selectedMesh.position.clone() : new THREE.Vector3(0,0,0);
+            selectedStartSliders = [v0, v1, v2];
+            adjBasis = { mode, eAxial: eAxial.clone(), eTang: eTang.clone(), eVert: eVert.clone() };
+        }
+
+        renderer.domElement.addEventListener('click', (event) => {
+            const rect = renderer.domElement.getBoundingClientRect();
+            pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+            pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+            raycaster.setFromCamera(pointer, camera);
+
+            const targets = [];
+            pmtGroup.children.forEach(ch => { if (ch.userData && ch.userData.pmtIdx !== undefined) targets.push(ch); });
+            pmtHWGroup.children.forEach(ch => { if (ch.userData && ch.userData.pmtIdx !== undefined && ch.visible) targets.push(ch); });
+
+            const hits = raycaster.intersectObjects(targets);
+            if (hits.length > 0) {
+                deselectPMT();
+                selectPMT(hits[0].object.userData.pmtIdx);
+            } else if (selectedIdx >= 0) {
+                deselectPMT();
+            }
+        });
+
+        // Slider live update
+        for (let k = 0; k < 3; k++) {
+            document.getElementById('adj-' + k).addEventListener('input', (e) => {
+                const idx = parseInt(e.target.id.split('-')[1]);
+                document.getElementById('adj-val-' + idx).textContent = parseFloat(e.target.value).toFixed(1);
+                updatePMTPreview();
+            });
+        }
+
+        document.getElementById('adj-save').addEventListener('click', async () => {
+            if (selectedIdx < 0) return;
+            const tubeId = pmtData.detector_nums[selectedIdx];
+            const axial = parseFloat(document.getElementById('adj-0').value);
+            const tangential = parseFloat(document.getElementById('adj-1').value);
+            const vertical = parseFloat(document.getElementById('adj-2').value);
+
+            // Capture current live-preview position before the fetch
+            const currentPos = new THREE.Vector3();
+            pmtGroup.children.some(ch => {
+                if (ch.userData && ch.userData.pmtIdx === selectedIdx) {
+                    currentPos.copy(ch.position);
+                    return true;
+                }
+                return false;
+            });
+
+            const resp = await fetch('/api/correction/save', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({tube_id: tubeId, axial, tangential, vertical}),
+            });
+            const result = await resp.json();
+            if (result.success) {
+                // Use the live-preview position directly (more reliable than server round-trip)
+                pmtGroup.children.forEach(ch => {
+                    if (ch.userData && ch.userData.pmtIdx === selectedIdx) {
+                        ch.position.copy(currentPos);
+                    }
+                });
+                pmtHWGroup.children.forEach(ch => {
+                    if (ch.userData && ch.userData.pmtIdx === selectedIdx) {
+                        ch.position.copy(currentPos);
+                    }
+                });
+                // Update start state so Cancel doesn't revert
+                meshStartPos = currentPos.clone();
+                selectedStartSliders = [
+                    parseFloat(document.getElementById('adj-0').value),
+                    parseFloat(document.getElementById('adj-1').value),
+                    parseFloat(document.getElementById('adj-2').value),
+                ];
+            }
+            deselectPMT();
+        });
+
+        document.getElementById('adj-reset').addEventListener('click', () => {
+            for (let k = 0; k < 3; k++) {
+                document.getElementById('adj-' + k).value = '0';
+                document.getElementById('adj-val-' + k).textContent = '0.0';
+            }
+            updatePMTPreview();
+        });
+
+        document.getElementById('adj-cancel').addEventListener('click', cancelAdjustment);
+
     } catch (e) {
         statusEl.textContent = 'Error: ' + e.message;
         console.error(e);
@@ -1341,14 +1813,79 @@ def run_server(args):
     pmt_info = load_pmts(pmt_csv, z_offset=args.z_offset,
                          bottom_rotation_deg=args.bottom_rot)
     VizHandler._pmt_types = pmt_info["types"]
+    VizHandler._pmt_data = pmt_info
     pmt_instance_data = pmt_info
+
+    # ---- Apply corrections to simulated PMT positions ----
+    _corr_path = Path(__file__).resolve().parent.parent / "corrections.csv"
+    VizHandler._corr_path = _corr_path
+    _corrections: dict[int, tuple[float, float, float]] = {}
+    if _corr_path.exists():
+        with open(_corr_path, newline="") as _f:
+            for _row in csv.DictReader(_f):
+                _tid = int(_row["tube_id"])
+                _dx = float(_row.get("dx", 0))
+                _dy = float(_row.get("dy", 0))
+                _dz = float(_row.get("dz", 0))
+                _corrections[_tid] = (_dx, _dy, _dz)
+        print(f"  Corrections: {len(_corrections)} loaded")
+        _dets = pmt_instance_data["detector_nums"]
+        _dirs = pmt_instance_data["directions"]
+        _positions = pmt_instance_data["instance_positions"]
+        _applied = 0
+        for _i, _tid in enumerate(_dets):
+            if _tid in _corrections:
+                _dx, _dy, _dz = _corrections[_tid]
+                # Cartesian shift in structure frame (mm)
+                _positions[_i, 0] += _dx
+                _positions[_i, 1] += _dy
+                _positions[_i, 2] += _dz
+                _applied += 1
+        print(f"  Corrections applied to {_applied} PMT instance positions")
+    else:
+        print("  No corrections.csv found — simulated detector uncorrected")
+    VizHandler._corrections = _corrections
 
     # Load scan mesh overlays
     print("Loading scan overlays...")
-    for _sn in ["AllPMTs", "SuperStructure", "BottomLayer", "TopLayer"]:
+    for _sn in [
+        "AllPMTs", "SuperStructure", "BottomLayer", "TopLayer",
+        "Panel-1", "Panel-2", "Panel-3", "Panel-4", "Panel-5", "Panel-6", "Panel-7", "Panel-8",
+        "Panel-1-PMTs", "Panel-2-PMTs", "Panel-3-PMTs", "Panel-4-PMTs",
+        "Panel-5-PMTs", "Panel-6-PMTs", "Panel-7-PMTs", "Panel-8-PMTs",
+        "TopPMTs", "BottomPMTs", "TankLid",
+    ]:
         if _load_scan_mesh(_sn):
             _n = len(np.load(SCAN_MESH_DIR / f"{_sn}_verts.npy"))
             print(f"  Scan mesh '{_sn}': {_n} verts")
+
+    # Load PMT tip positions
+    global PMT_TIPS_CACHE
+    _tips_path = SCAN_MESH_DIR / "pmt_tip_positions.csv"
+    if _tips_path.exists():
+        tips = []
+        with open(_tips_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                tips.append({
+                    "tube_id": int(row["tube_id"]),
+                    "panel": int(row["panel"]),
+                    "type": row["type"],
+                    "tip_x": float(row["tip_x"]),
+                    "tip_y": float(row["tip_y"]),
+                    "tip_z": float(row["tip_z"]),
+                    "csv_x": float(row["csv_x"]),
+                    "csv_y": float(row["csv_y"]),
+                    "csv_z": float(row["csv_z"]),
+                    "offset_mm": float(row["offset_mm"]),
+                    "n_verts": int(row["n_verts"]),
+                    "reliability": float(row["reliability"]),
+                    "found": row["found"].strip() in ("1", "true", "True"),
+                })
+        PMT_TIPS_CACHE = tips
+        print(f"  PMT tips: {len(tips)} loaded")
+    else:
+        print(f"  PMT tips: NOT FOUND ({_tips_path})")
 
     host = args.host
     port = args.port

@@ -232,7 +232,7 @@ def load_pmts(scan_path: Path, z_offset: float = 0.0,
         z_s += z_offset
 
         # Extra Z-rotation for bottom panel (panel 0)
-        if pn == 0 and bottom_rotation_deg != 0.0:
+        if bottom_rotation_deg != 0.0:
             xs = x_s
             x_s = xs * _bcos - y_s * _bsin
             y_s = xs * _bsin + y_s * _bcos

@@ -23,7 +23,10 @@ def process_ply(name: str):
 
 def main():
     print("Pre-processing scan PLY files for viz server...")
-    for name in ["AllPMTs", "SuperStructure", "BottomLayer", "TopLayer"]:
+    struct_panels = [f"Panel-{i}" for i in range(1, 9)]
+    pmt_panels = [f"Panel-{i}-PMTs" for i in range(1, 9)]
+    extra = pmt_panels + struct_panels + ["TankLid", "BottomPMTs", "TopPMTs"]
+    for name in ["AllPMTs", "SuperStructure", "BottomLayer", "TopLayer"] + extra:
         process_ply(name)
     print("Done.")
 

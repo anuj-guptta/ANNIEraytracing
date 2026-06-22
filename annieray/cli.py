@@ -64,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     viz.add_argument("--lappd-model", choices=["default", "annie"], default="annie",
                      help="LAPPD geometry model (default: bare rectangle; annie: housed LAPPD)")
     viz.add_argument("--bottom-rot", type=float, default=45.0,
-                     help="Extra Z-rotation (deg) for bottom (panel-0) PMTs only, e.g. 22.5")
+                     help="Extra Z-rotation (deg) for all PMTs, aligning scan mesh with structure (default: 45)")
 
     detcfg = sub.add_parser("build-detector-config",
                             help="Build detector registry YAML from geometry")
