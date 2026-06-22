@@ -152,6 +152,18 @@ def _tank_to_structure(x_w: float, y_w: float, z_w: float
     return x_s, y_s, z_s
 
 
+def rotate_z(points: np.ndarray, angle_deg: float) -> np.ndarray:
+    """Rotate (N,3) array of positions/directions by angle_deg around Z (in-place)."""
+    theta = math.radians(angle_deg)
+    c = math.cos(theta)
+    s = math.sin(theta)
+    x = points[:, 0].copy()
+    y = points[:, 1].copy()
+    points[:, 0] = x * c - y * s
+    points[:, 1] = x * s + y * c
+    return points
+
+
 def _ideal_direction(pmt_type: str, x_s: float, y_s: float
                      ) -> tuple[float, float, float]:
     """Return the ideal inward-pointing unit direction in structure frame.
@@ -175,7 +187,8 @@ def _ideal_direction(pmt_type: str, x_s: float, y_s: float
 
 
 def load_pmts(scan_path: Path, z_offset: float = 0.0,
-              bottom_rotation_deg: float = 0.0) -> dict:
+              bottom_rotation_deg: float = 0.0,
+              det_rotation_deg: float = 22.5) -> dict:
     """Parse WCSim scan file and return PMT data in structure rest frame.
 
     Pipeline: scan (cm) → hall frame (mm) → structure rest frame.
@@ -250,6 +263,11 @@ def load_pmts(scan_path: Path, z_offset: float = 0.0,
         directions[i] = [dx_s, dy_s, dz_s]
         type_names.append(ptype)
         det_nums.append(int(tube_ids[i]))
+
+    # Apply global detector rotation (Z-axis) to all PMT positions and directions
+    if det_rotation_deg != 0.0:
+        rotate_z(centers, det_rotation_deg)
+        rotate_z(directions, det_rotation_deg)
 
     # After the loop, compute per-PMT mesh type index and rotation quaternion
     mesh_type_indices = np.array([PMT_MESH_TYPE.get(t, 0) for t in type_names], dtype=np.int32)

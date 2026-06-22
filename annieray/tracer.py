@@ -100,6 +100,7 @@ def build_geometry(
     z_offset: float = 0.0,
     lappd_model: str = "default",
     bottom_rotation_deg: float = 45.0,
+    det_rotation_deg: float = 22.5,
 ) -> Geometry:
     """Build a Geometry from a GDML file and optional PMT/STEP data sources.
 
@@ -113,6 +114,8 @@ def build_geometry(
     """
     # ---- Stage 1: parse the GDML structure mesh ----
     verts, tris = gdml_parser.parse_gdml(gdml_path)
+    if det_rotation_deg != 0.0 and verts.shape[0] > 0:
+        pmt_loader.rotate_z(verts, det_rotation_deg)
 
     # ---- Stage 2: load PMT positions ----
     # PMTs can come from: (a) Scan CSV file, (b) STEP manifest JSON, (c) STEP raw.
@@ -120,7 +123,8 @@ def build_geometry(
     pmt_directions = np.zeros((0, 3), dtype=np.float32)
     if pmt_csv_path and pmt_csv_path.exists():
         pmt_data = pmt_loader.load_pmts(pmt_csv_path, z_offset=z_offset,
-                                         bottom_rotation_deg=bottom_rotation_deg)
+                                         bottom_rotation_deg=bottom_rotation_deg,
+                                         det_rotation_deg=det_rotation_deg)
         pmt_centers = pmt_data["centers"]
         pmt_radii = pmt_data["radii"]
         pmt_directions = pmt_data["directions"]
@@ -207,6 +211,11 @@ def build_geometry(
             strip_list.append([0.0, 0.0, 1.0])
         lappd_data = np.array(lappd_list, dtype=np.float32) if lappd_list else np.zeros((0, 7), dtype=np.float32)
         lappd_strip_axes = np.array(strip_list, dtype=np.float32) if strip_list else np.zeros((0, 3), dtype=np.float32)
+        if det_rotation_deg != 0.0 and lappd_data.shape[0] > 0:
+            pmt_loader.rotate_z(lappd_data[:, :3], det_rotation_deg)
+            # Also rotate the inward-normal direction (columns 3:6)
+            pmt_loader.rotate_z(lappd_data[:, 3:6], det_rotation_deg)
+            # Strip axis is Z-up (0,0,1) for barrel LAPPDs — stays unchanged by Z rotation
 
     # ---- Stage 5: ANNIE LAPPD housing model ----
     # When --lappd-model=annie, replaces the default rectangle closest to
@@ -223,6 +232,16 @@ def build_geometry(
 
         housing = build_housing((cx, cy, cz), normal)
         lappd_housing_data, annie_lappd_data = housing_to_arrays(housing)
+        if det_rotation_deg != 0.0:
+            if lappd_housing_data.shape[0] > 0:
+                # Columns: 0:3=centre, 3:6=ax, 6:9=ay, 9:12=az, 12:15=half (scalars), 15=pad
+                pmt_loader.rotate_z(lappd_housing_data[:, 0:3], det_rotation_deg)
+                pmt_loader.rotate_z(lappd_housing_data[:, 3:6], det_rotation_deg)
+                pmt_loader.rotate_z(lappd_housing_data[:, 6:9], det_rotation_deg)
+                pmt_loader.rotate_z(lappd_housing_data[:, 9:12], det_rotation_deg)
+            if annie_lappd_data.shape[0] > 0:
+                pmt_loader.rotate_z(annie_lappd_data[:, 0:3], det_rotation_deg)
+                pmt_loader.rotate_z(annie_lappd_data[:, 3:6], det_rotation_deg)
 
     # ---- Stage 6: build detector registry ----
     # Creates a list of DetectorInfo objects with stable IDs (WCSim TubeIDs

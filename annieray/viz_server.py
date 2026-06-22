@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import time
 import xml.etree.ElementTree as ET
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -76,14 +77,16 @@ PMT_TIPS_CACHE: list[dict] | None = None  # loaded from pmt_tip_positions.csv
 SCAN_MESH_DIR = Path("scan files by part") / "transformed"
 SCAN_MESH_CACHE: dict[str, tuple[bytes, bytes]] = {}  # name -> (verts_bytes, tris_bytes)
 
-def _load_scan_mesh(name: str):
+def _load_scan_mesh(name: str, det_rotation_deg: float = 0.0):
     """Load a pre-processed scan mesh from .npy files into the cache."""
     verts_path = SCAN_MESH_DIR / f"{name}_verts.npy"
     tris_path = SCAN_MESH_DIR / f"{name}_tris.npy"
     if verts_path.exists() and tris_path.exists():
-        verts = np.load(verts_path).tobytes()
-        tris = np.load(tris_path).tobytes()
-        SCAN_MESH_CACHE[name] = (verts, tris)
+        verts = np.load(verts_path)
+        tris = np.load(tris_path)
+        if det_rotation_deg != 0.0:
+            rotate_z(verts, det_rotation_deg)
+        SCAN_MESH_CACHE[name] = (verts.tobytes(), tris.tobytes())
         return True
     return False
 
@@ -1805,13 +1808,15 @@ def run_server(args):
         z_offset=args.z_offset,
         lappd_model=args.lappd_model,
         bottom_rotation_deg=args.bottom_rot,
+        det_rotation_deg=args.det_rotation,
     )
     print(f"  Mesh: {geometry.mesh_vertices.shape[0]} verts, {geometry.mesh_triangles.shape[0]} tris")
     print(f"  PMTs: {geometry.pmt_centers.shape[0]}")
 
-    from annieray.pmt_loader import load_pmts
+    from annieray.pmt_loader import load_pmts, rotate_z
     pmt_info = load_pmts(pmt_csv, z_offset=args.z_offset,
-                         bottom_rotation_deg=args.bottom_rot)
+                         bottom_rotation_deg=args.bottom_rot,
+                         det_rotation_deg=args.det_rotation)
     VizHandler._pmt_types = pmt_info["types"]
     VizHandler._pmt_data = pmt_info
     pmt_instance_data = pmt_info
@@ -1833,10 +1838,15 @@ def run_server(args):
         _dirs = pmt_instance_data["directions"]
         _positions = pmt_instance_data["instance_positions"]
         _applied = 0
+        _cr = args.det_rotation
         for _i, _tid in enumerate(_dets):
             if _tid in _corrections:
                 _dx, _dy, _dz = _corrections[_tid]
-                # Cartesian shift in structure frame (mm)
+                if _cr != 0.0:
+                    _th = math.radians(_cr)
+                    _c = math.cos(_th)
+                    _s = math.sin(_th)
+                    _dx, _dy = _dx * _c - _dy * _s, _dx * _s + _dy * _c
                 _positions[_i, 0] += _dx
                 _positions[_i, 1] += _dy
                 _positions[_i, 2] += _dz
@@ -1848,6 +1858,7 @@ def run_server(args):
 
     # Load scan mesh overlays
     print("Loading scan overlays...")
+    _det_rot = args.det_rotation
     for _sn in [
         "AllPMTs", "SuperStructure", "BottomLayer", "TopLayer",
         "Panel-1", "Panel-2", "Panel-3", "Panel-4", "Panel-5", "Panel-6", "Panel-7", "Panel-8",
@@ -1855,7 +1866,7 @@ def run_server(args):
         "Panel-5-PMTs", "Panel-6-PMTs", "Panel-7-PMTs", "Panel-8-PMTs",
         "TopPMTs", "BottomPMTs", "TankLid",
     ]:
-        if _load_scan_mesh(_sn):
+        if _load_scan_mesh(_sn, det_rotation_deg=_det_rot):
             _n = len(np.load(SCAN_MESH_DIR / f"{_sn}_verts.npy"))
             print(f"  Scan mesh '{_sn}': {_n} verts")
 
@@ -1864,19 +1875,32 @@ def run_server(args):
     _tips_path = SCAN_MESH_DIR / "pmt_tip_positions.csv"
     if _tips_path.exists():
         tips = []
+        _tip_rot = args.det_rotation
         with open(_tips_path, newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
+                tip_x = float(row["tip_x"])
+                tip_y = float(row["tip_y"])
+                tip_z = float(row["tip_z"])
+                csv_x = float(row["csv_x"])
+                csv_y = float(row["csv_y"])
+                csv_z = float(row["csv_z"])
+                if _tip_rot != 0.0:
+                    theta = math.radians(_tip_rot)
+                    c = math.cos(theta)
+                    s = math.sin(theta)
+                    tip_x, tip_y = tip_x * c - tip_y * s, tip_x * s + tip_y * c
+                    csv_x, csv_y = csv_x * c - csv_y * s, csv_x * s + csv_y * c
                 tips.append({
                     "tube_id": int(row["tube_id"]),
                     "panel": int(row["panel"]),
                     "type": row["type"],
-                    "tip_x": float(row["tip_x"]),
-                    "tip_y": float(row["tip_y"]),
-                    "tip_z": float(row["tip_z"]),
-                    "csv_x": float(row["csv_x"]),
-                    "csv_y": float(row["csv_y"]),
-                    "csv_z": float(row["csv_z"]),
+                    "tip_x": tip_x,
+                    "tip_y": tip_y,
+                    "tip_z": tip_z,
+                    "csv_x": csv_x,
+                    "csv_y": csv_y,
+                    "csv_z": csv_z,
                     "offset_mm": float(row["offset_mm"]),
                     "n_verts": int(row["n_verts"]),
                     "reliability": float(row["reliability"]),

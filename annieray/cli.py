@@ -46,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Path to detector registry YAML (auto-built if absent)")
     run.add_argument("--wavelength", type=float, default=350.0,
                      help="Photon wavelength in nm (default: 350)")
+    run.add_argument("--det-rotation", type=float, default=22.5,
+                     help="Global Z-rotation (deg) so +Y aligns with octagon corner (default: 22.5)")
 
     cherenkov = sub.add_parser("extract-manifest", help="Extract component manifest from STEP")
     cherenkov.add_argument("--step", required=True, type=Path, help="Path to STEP CAD file")
@@ -65,6 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="LAPPD geometry model (default: bare rectangle; annie: housed LAPPD)")
     viz.add_argument("--bottom-rot", type=float, default=45.0,
                      help="Extra Z-rotation (deg) for all PMTs, aligning scan mesh with structure (default: 45)")
+    viz.add_argument("--det-rotation", type=float, default=22.5,
+                     help="Global Z-rotation (deg) so +Y aligns with octagon corner (default: 22.5)")
 
     detcfg = sub.add_parser("build-detector-config",
                             help="Build detector registry YAML from geometry")
@@ -79,6 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
     detcfg.add_argument("--z-offset", type=float, default=0.0, help="Vertical offset (mm)")
     detcfg.add_argument("--lappd-model", choices=["default", "annie"], default="default",
                         help="LAPPD geometry model")
+    detcfg.add_argument("--det-rotation", type=float, default=22.5,
+                        help="Global Z-rotation (deg) so +Y aligns with octagon corner (default: 22.5)")
 
     lappd = sub.add_parser("viz-lappd", help="Start standalone LAPPD module viewer")
     lappd.add_argument("--host", type=str, default="localhost", help="Host to bind (default: localhost)")
@@ -177,7 +183,8 @@ def run_command(args: argparse.Namespace) -> None:
     print(f"Loading geometry from {args.gdml}...")
     geom = build_geometry(args.gdml, step_path=args.step, manifest_path=args.manifest,
                           pmt_csv_path=args.pmt_csv, lappd_indices=lappd_indices,
-                          no_lappd=args.no_lappd, z_offset=args.z_offset, lappd_model=args.lappd_model)
+                          no_lappd=args.no_lappd, z_offset=args.z_offset, lappd_model=args.lappd_model,
+                          det_rotation_deg=args.det_rotation)
 
     print(f"  Mesh: {geom.mesh_vertices.shape[0]} vertices, {geom.mesh_triangles.shape[0]} triangles")
     print(f"  PMTs: {geom.pmt_centers.shape[0]} (radii: {set(f'{r:.1f}' for r in geom.pmt_radii)})")
@@ -232,7 +239,8 @@ def build_detector_config_command(args: argparse.Namespace) -> None:
     print(f"Loading geometry from {args.gdml}...")
     geom = build_geometry(args.gdml, step_path=args.step, manifest_path=args.manifest,
                           pmt_csv_path=args.pmt_csv, no_lappd=args.no_lappd,
-                          z_offset=args.z_offset, lappd_model=args.lappd_model)
+                          z_offset=args.z_offset, lappd_model=args.lappd_model,
+                          det_rotation_deg=args.det_rotation)
 
     print(f"  Built {len(geom.detectors)} detectors:")
     for d in geom.detectors:

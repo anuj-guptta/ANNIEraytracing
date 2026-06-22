@@ -7,14 +7,39 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import csv
 import json
+import math
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 import numpy as np
 
+# ---- CLI ----
+_cli = argparse.ArgumentParser()
+_cli.add_argument("--det-rotation", type=float, default=22.5,
+                  help="Global Z-rotation (deg) so +Y aligns with octagon corner (default: 22.5)")
+_cli_args, _ = _cli.parse_known_args()
+DET_ROTATION = _cli_args.det_rotation
+
+
+def rotate_z(points: np.ndarray, angle_deg: float) -> None:
+    """Rotate (N,3) array in-place by angle_deg around Z."""
+    if angle_deg == 0.0 or points.shape[0] == 0:
+        return
+    theta = math.radians(angle_deg)
+    c = math.cos(theta)
+    s = math.sin(theta)
+    x = points[:, 0].copy()
+    y = points[:, 1].copy()
+    points[:, 0] = x * c - y * s
+    points[:, 1] = x * s + y * c
+
 SCAN_DIR = Path("scan files by part") / "transformed"
+TIPS_PATH = SCAN_DIR / "pmt_tip_positions.csv"
+PLACED_PATH = Path(__file__).resolve().parent.parent / "placed_tips.csv"
+CORRECTIONS_PATH = Path(__file__).resolve().parent.parent / "corrections.csv"
 
 # ---- Load all available scan meshes into byte caches ----
 MESH_CACHE: dict[str, tuple[bytes, bytes, int]] = {}
@@ -23,10 +48,12 @@ for _f in sorted(SCAN_DIR.glob("*_verts.npy")):
     _name = _f.stem.replace("_verts", "")
     _tris = SCAN_DIR / f"{_name}_tris.npy"
     if _tris.exists():
-        _v = np.load(_f).astype(np.float32).tobytes()
-        _t = np.load(_tris).astype(np.int32).tobytes()
-        _n = len(np.load(_f))
-        MESH_CACHE[_name] = (_v, _t, _n)
+        _v = np.load(_f).astype(np.float32)
+        if DET_ROTATION != 0.0:
+            rotate_z(_v, DET_ROTATION)
+        _t = np.load(_tris).astype(np.int32)
+        _n = len(_v)
+        MESH_CACHE[_name] = (_v.tobytes(), _t.tobytes(), _n)
 
 MESH_NAMES = sorted(MESH_CACHE.keys())
 print(f"  Meshes loaded: {len(MESH_CACHE)}")
@@ -34,69 +61,99 @@ for _mn in MESH_NAMES:
     _nv = MESH_CACHE[_mn][2]
     print(f"    {_mn}: {_nv} verts")
 
-# ---- Load PMT tip positions ----
-TIPS_PATH = SCAN_DIR / "pmt_tip_positions.csv"
-TIPS: list[dict] = []
-if TIPS_PATH.exists():
-    with open(TIPS_PATH, newline="") as f:
-        for row in csv.DictReader(f):
-            TIPS.append({
-                "tip_x": float(row["tip_x"]),
-                "tip_y": float(row["tip_y"]),
-                "tip_z": float(row["tip_z"]),
-                "csv_x": float(row["csv_x"]),
-                "csv_y": float(row["csv_y"]),
-                "csv_z": float(row["csv_z"]),
-                "tube_id": int(row["tube_id"]),
-                "panel": int(row["panel"]),
-                "type": row["type"],
-                "reliability": float(row["reliability"]),
-                "offset_mm": float(row.get("offset_mm", 0)),
-                "found": row["found"].strip() in ("1", "true", "True"),
-            })
-    print(f"  Tips: {len(TIPS)} loaded")
-else:
-    print("  Tip positions NOT FOUND — run find_pmt_tips.py first")
+def _rotate_tip_pt(x: float, y: float) -> tuple[float, float]:
+    """Rotate an XY point by the detector rotation."""
+    if DET_ROTATION == 0.0:
+        return x, y
+    theta = math.radians(DET_ROTATION)
+    c = math.cos(theta)
+    s = math.sin(theta)
+    return x * c - y * s, x * s + y * c
 
-# ---- Load previously placed tips ----
-PLACED_PATH = Path(__file__).resolve().parent.parent / "placed_tips.csv"
-PLACED_TIPS: list[dict] = []
-if PLACED_PATH.exists():
-    with open(PLACED_PATH, newline="") as f:
-        for row in csv.DictReader(f):
-            PLACED_TIPS.append({
-                "id": int(row["id"]),
-                "x": float(row["x"]),
-                "y": float(row["y"]),
-                "z": float(row["z"]),
-            })
-    print(f"  Placed tips: {len(PLACED_TIPS)} loaded")
-else:
-    print("  Placed tips file NOT FOUND — no placed_tips.csv at project root")
 
-# ---- Load corrections ----
-CORRECTIONS_PATH = Path(__file__).resolve().parent.parent / "corrections.csv"
-CORRECTIONS: dict[int, tuple[float, float, float]] = {}
-if CORRECTIONS_PATH.exists():
-    with open(CORRECTIONS_PATH, newline="") as f:
-        for row in csv.DictReader(f):
-            tid = int(row["tube_id"])
-            dx = float(row.get("dx", 0))
-            dy = float(row.get("dy", 0))
-            dz = float(row.get("dz", 0))
-            CORRECTIONS[tid] = (dx, dy, dz)
-    print(f"  Corrections: {len(CORRECTIONS)} loaded")
+def _load_tips():
+    """Load, correct, and rotate PMT tip positions."""
+    tips = []
+    if TIPS_PATH.exists():
+        with open(TIPS_PATH, newline="") as f:
+            for row in csv.DictReader(f):
+                tips.append({
+                    "tip_x": float(row["tip_x"]),
+                    "tip_y": float(row["tip_y"]),
+                    "tip_z": float(row["tip_z"]),
+                    "csv_x": float(row["csv_x"]),
+                    "csv_y": float(row["csv_y"]),
+                    "csv_z": float(row["csv_z"]),
+                    "tube_id": int(row["tube_id"]),
+                    "panel": int(row["panel"]),
+                    "type": row["type"],
+                    "reliability": float(row["reliability"]),
+                    "offset_mm": float(row.get("offset_mm", 0)),
+                    "found": row["found"].strip() in ("1", "true", "True"),
+                })
+        print(f"  Tips: {len(tips)} loaded")
+    else:
+        print("  Tip positions NOT FOUND — run find_pmt_tips.py first")
+    return tips
 
-    # Apply corrections to simulated positions (csv) only — not scan tips
+
+def _load_placed():
+    """Load placed tips."""
+    placed = []
+    if PLACED_PATH.exists():
+        with open(PLACED_PATH, newline="") as f:
+            for row in csv.DictReader(f):
+                px, py = _rotate_tip_pt(float(row["x"]), float(row["y"]))
+                placed.append({
+                    "id": int(row["id"]),
+                    "x": px,
+                    "y": py,
+                    "z": float(row["z"]),
+                })
+        print(f"  Placed tips: {len(placed)} loaded")
+    else:
+        print("  Placed tips file NOT FOUND — no placed_tips.csv at project root")
+    return placed
+
+
+def _load_corrections() -> dict[int, tuple[float, float, float]]:
+    """Load corrections, rotating them into the detector frame."""
+    corr = {}
+    if CORRECTIONS_PATH.exists():
+        with open(CORRECTIONS_PATH, newline="") as f:
+            for row in csv.DictReader(f):
+                tid = int(row["tube_id"])
+                dx = float(row.get("dx", 0))
+                dy = float(row.get("dy", 0))
+                dz = float(row.get("dz", 0))
+                if DET_ROTATION != 0.0:
+                    dx, dy = _rotate_tip_pt(dx, dy)
+                corr[tid] = (dx, dy, dz)
+        print(f"  Corrections: {len(corr)} loaded")
+    return corr
+
+
+# ---- Load data (order: tips → corrections → rotate → apply) ----
+TIPS = _load_tips()
+PLACED_TIPS = _load_placed()
+CORRECTIONS = _load_corrections()
+
+# Rotate all tip positions into the detector frame
+if DET_ROTATION != 0.0:
     for tip in TIPS:
-        c = CORRECTIONS.get(tip["tube_id"])
-        if c:
-            tip["csv_x"] += c[0]
-            tip["csv_y"] += c[1]
-            tip["csv_z"] += c[2]
-    print(f"  Corrections applied to {len([t for t in TIPS if t['tube_id'] in CORRECTIONS])} csv positions")
-else:
-    print("  No corrections.csv found — running uncorrected")
+        tip["tip_x"], tip["tip_y"] = _rotate_tip_pt(tip["tip_x"], tip["tip_y"])
+        tip["csv_x"], tip["csv_y"] = _rotate_tip_pt(tip["csv_x"], tip["csv_y"])
+
+# Apply rotated corrections to rotated simulated (csv) positions
+for tip in TIPS:
+    c = CORRECTIONS.get(tip["tube_id"])
+    if c:
+        tip["csv_x"] += c[0]
+        tip["csv_y"] += c[1]
+        tip["csv_z"] += c[2]
+if CORRECTIONS:
+    n_applied = sum(1 for t in TIPS if t['tube_id'] in CORRECTIONS)
+    print(f"  Corrections applied to {n_applied} csv positions")
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="en">
