@@ -67,6 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="LAPPD geometry model (default: bare rectangle; annie: housed LAPPD)")
     viz.add_argument("--bottom-rot", type=float, default=45.0,
                      help="Extra Z-rotation (deg) for all PMTs, aligning scan mesh with structure (default: 45)")
+    viz.add_argument("--bottom-spin", type=float, default=22.5,
+                     help="Per-PMT spin (deg) about forward axis for bottom PMTs (default: 22.5)")
     viz.add_argument("--det-rotation", type=float, default=22.5,
                      help="Global Z-rotation (deg) so +Y aligns with octagon corner (default: 22.5)")
 

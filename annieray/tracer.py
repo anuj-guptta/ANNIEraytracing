@@ -40,8 +40,9 @@ HDI = 9  # detector_index(which detector in the registry; -1 = not a detector)
 HDS = 10 # detector_system(which detector type: 0 = PMT, 1 = LAPPD default, 2 = LAPPD annie)
 HLU = 11 # local_u      (PMT: polar angle θ from direction in rad; LAPPD: position along strips in mm)
 HLV = 12 # local_v      (PMT: azimuthal angle φ in rad; LAPPD: position across strips in mm)
+HMAT = 13 # material_id  (MaterialID enum value, e.g. GLASS=1, PHOTOCATHODE=2, ...)
 
-N_HIT_COLS = 13
+N_HIT_COLS = 14
 
 # Speed of light in vacuum (mm/ns)
 C_MM_NS = 299.792458
@@ -89,6 +90,9 @@ class Geometry:
     # ---- Detector registry (not used by the kernel) ----
     detectors: list = field(default_factory=list)  # list[DetectorInfo]
 
+    # ---- Per-triangle material IDs for structure mesh ----
+    mesh_material_ids: np.ndarray | None = None  # (M,) int32 — MaterialID per tri
+
 
 def build_geometry(
     gdml_path: Path,
@@ -100,6 +104,7 @@ def build_geometry(
     z_offset: float = 0.0,
     lappd_model: str = "default",
     bottom_rotation_deg: float = 45.0,
+    bottom_spin_deg: float = 0.0,
     det_rotation_deg: float = 22.5,
 ) -> Geometry:
     """Build a Geometry from a GDML file and optional PMT/STEP data sources.
@@ -124,6 +129,7 @@ def build_geometry(
     if pmt_csv_path and pmt_csv_path.exists():
         pmt_data = pmt_loader.load_pmts(pmt_csv_path, z_offset=z_offset,
                                          bottom_rotation_deg=bottom_rotation_deg,
+                                         bottom_spin_deg=bottom_spin_deg,
                                          det_rotation_deg=det_rotation_deg)
         pmt_centers = pmt_data["centers"]
         pmt_radii = pmt_data["radii"]
@@ -269,9 +275,14 @@ def build_geometry(
         annie_lappd_data=annie_lappd_data if annie_lappd_data.shape[0] > 0 else None,
     )
 
+    # Default: all structure mesh triangles are TEFLON (ID 4)
+    n_tris = tris.shape[0]
+    mesh_material_ids = np.full(n_tris, 4, dtype=np.int32) if n_tris > 0 else np.zeros(0, dtype=np.int32)
+
     return Geometry(
         mesh_vertices=verts,
         mesh_triangles=tris,
+        mesh_material_ids=mesh_material_ids,
         pmt_centers=pmt_centers,
         pmt_radii=pmt_radii,
         pmt_directions=pmt_directions,
@@ -689,6 +700,7 @@ def trace_kernel(
     directions: ti.types.ndarray(ndim=2),
     mesh_vertices: ti.types.ndarray(ndim=2),
     mesh_triangles: ti.types.ndarray(ndim=2),
+    mesh_material_ids: ti.types.ndarray(ndim=1),
     pmt_centers: ti.types.ndarray(ndim=2),
     pmt_radii: ti.types.ndarray(ndim=1),
     pmt_dirs: ti.types.ndarray(ndim=2),
@@ -732,6 +744,7 @@ def trace_kernel(
         best_det_sys = DET_SYS_NONE
         best_lu = 0.0
         best_lv = 0.0
+        best_mat = 0  # MaterialID
 
         for t in range(n_tris):
             i0 = mesh_triangles[t, 0]
@@ -766,6 +779,7 @@ def trace_kernel(
                 best_nz = nz
                 best_det_idx = -1
                 best_det_sys = DET_SYS_NONE
+                best_mat = mesh_material_ids[t] if mesh_material_ids.shape[0] > 0 else 0
 
         for p in range(n_pmts):
             pcx = pmt_centers[p, 0]
@@ -802,6 +816,7 @@ def trace_kernel(
                     theta, phi = _pmt_local_coords(nx, ny, nz, pdx, pdy, pdz)
                     best_lu = theta
                     best_lv = phi
+                    best_mat = 2  # PHOTOCATHODE (forward hemisphere)
 
         for l in range(n_lappds):
             lcx = lappd_data[l, 0]
@@ -841,6 +856,7 @@ def trace_kernel(
                 )
                 best_lu = uu
                 best_lv = vv
+                best_mat = 5  # ACRYLIC (LAPPD window)
 
         # ---- ANNIE LAPPD housing model (if present) ----
         for h in range(n_housings):
@@ -903,6 +919,7 @@ def trace_kernel(
                 )
                 best_lu = uu
                 best_lv = vv
+                best_mat = 2  # PHOTOCATHODE (ANNIE LAPPD)
 
         hit, t_hit, nx, ny, nz = _ray_tank_intersect(
             ox, oy, oz, dx, dy, dz,
@@ -935,6 +952,7 @@ def trace_kernel(
         hits[i, HDS] = best_det_sys * 1.0
         hits[i, HLU] = best_lu
         hits[i, HLV] = best_lv
+        hits[i, HMAT] = best_mat * 1.0
 
 
 def trace_rays(
@@ -953,6 +971,8 @@ def trace_rays(
         directions,
         geometry.mesh_vertices,
         geometry.mesh_triangles.astype(np.int32),
+        geometry.mesh_material_ids if geometry.mesh_material_ids is not None
+        else np.zeros(0, dtype=np.int32),
         geometry.pmt_centers,
         geometry.pmt_radii,
         geometry.pmt_directions,
@@ -981,18 +1001,19 @@ def trace_cherenkov(
 
     Workflow:
       1. Call generate_cherenkov_photons() to get (origins, directions).
-      2. Run the GPU kernel via trace_rays() → (N, 13) hit array.
-      3. Expand to (N, 15) by appending arrival_time and wavelength.
+      2. Run the GPU kernel via trace_rays() → (N, 14) hit array.
+      3. Expand to (N, 16) by appending arrival_time and wavelength.
 
     The expansion is the place to add per-photon wavelength and timing.
     Currently wavelength_nm is a single scalar; for a per-photon spectrum,
     generate_cherenkov_photons() should return a wavelength array and this
-    function should stamp it into full[:, 14] per-photon instead.
+    function should stamp it into full[:, 15] per-photon instead.
 
-    Returns (N, 15) hit array with columns:
+    Returns (N, 16) hit array with columns:
         0: hit_flag, 1: t (mm), 2-4: x,y,z, 5-7: nx,ny,nz,
         8: component_id, 9: detector_index, 10: detector_system,
-        11: local_u, 12: local_v, 13: arrival_time (ns), 14: wavelength (nm)
+        11: local_u, 12: local_v, 13: material_id,
+        14: arrival_time (ns), 15: wavelength (nm)
     """
     from annieray.cherenkov import generate_cherenkov_photons
 

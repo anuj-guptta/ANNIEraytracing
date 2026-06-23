@@ -188,6 +188,7 @@ def _ideal_direction(pmt_type: str, x_s: float, y_s: float
 
 def load_pmts(scan_path: Path, z_offset: float = 0.0,
               bottom_rotation_deg: float = 0.0,
+              bottom_spin_deg: float = 0.0,
               det_rotation_deg: float = 22.5) -> dict:
     """Parse WCSim scan file and return PMT data in structure rest frame.
 
@@ -202,6 +203,9 @@ def load_pmts(scan_path: Path, z_offset: float = 0.0,
         bottom_rotation_deg: Extra rotation about Z for panel-0 (bottom)
                              PMTs only, in degrees.  Multiples of 22.5°
                              align with the 4-fold bottom structure.
+        bottom_spin_deg: Extra spin about the tube's own forward axis for
+                         panel-0 (bottom) PMTs only, in degrees.  Rotates
+                         the mesh orientation without changing the position.
 
     Returns dict with:
         centers: (N, 3) float32 — sphere centres in mm
@@ -278,6 +282,20 @@ def load_pmts(scan_path: Path, z_offset: float = 0.0,
         fwd = PMT_FORWARD.get(type_names[i], (0.0, 0.0, 1.0))
         tgt = directions[i]
         q = _forward_to_quat(np.array(fwd, dtype=np.float64), tgt)
+
+        # Spin about the tube's forward axis for bottom panel
+        if bottom_spin_deg != 0.0 and panel_nrs[i] == 0:
+            half = math.radians(bottom_spin_deg) / 2.0
+            s = math.sin(half)
+            q_spin = np.array([tgt[0] * s, tgt[1] * s, tgt[2] * s, math.cos(half)], dtype=np.float64)
+            # Multiply q_spin * q
+            x1, y1, z1, w1 = q_spin
+            x2, y2, z2, w2 = q
+            q = np.array([w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                          w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                          w1*z2 + x1*y2 - y1*x2 + z1*w2,
+                          w1*w2 - x1*x2 - y1*y2 - z1*z2], dtype=np.float32)
+
         quaternions[i] = q
         # Shift position so bulb tip is at sphere surface (center + radius * direction)
         off = PMT_FORWARD_OFFSET.get(type_names[i], 0.0)

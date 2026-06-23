@@ -50,6 +50,103 @@ def _parse_gdml_flattened(path: Path, recenter=True):
         arr -= arr.mean(axis=0)
     return arr.tobytes(), len(arr)
 
+def _build_color_buffer(flat_verts: np.ndarray, type_name: str, type_idx: int) -> bytes:
+    """Build per-vertex RGBA uint8 color buffer for a PMT mesh type.
+
+    Parameters
+    ----------
+    flat_verts:
+        ``(V, 3)`` float32 — flat vertex buffer (same layout as PMT_MESH_CACHE).
+    type_name:
+        PMT type name (e.g. ``"Hamamatsu"``) or ``"hw"`` for hardware.
+    type_idx:
+        Mesh type index (used for hardware classification).
+
+    Returns
+    -------
+        ``(V * 4,)`` bytes — RGBA uint8 per vertex.
+    """
+    from annieray.materials import classify_pmt_body, classify_pmt_hardware
+    from annieray.materials import MATERIAL_TABLE, MaterialID
+
+    n_tris = len(flat_verts) // 3
+
+    if type_name == "hw":
+        mat_ids = classify_pmt_hardware(type_idx, n_tris)
+    else:
+        tris = flat_verts.reshape(-1, 3, 3)
+        mat_ids = classify_pmt_body(tris, type_name)
+
+    colors = np.zeros((n_tris * 3, 4), dtype=np.uint8)
+    for tri_idx, mid in enumerate(mat_ids):
+        props = MATERIAL_TABLE.get(MaterialID(int(mid)))
+        r = int(props.color[0] * 255)
+        g = int(props.color[1] * 255)
+        b = int(props.color[2] * 255)
+        colors[tri_idx * 3] = [r, g, b, 255]
+        colors[tri_idx * 3 + 1] = [r, g, b, 255]
+        colors[tri_idx * 3 + 2] = [r, g, b, 255]
+
+    return colors.tobytes()
+
+def _build_pc_sub_mesh(flat_verts: np.ndarray, type_name: str, type_idx: int,
+                        offset_mm: float = 1.0) -> bytes:
+    """Build PC sub-mesh (PC triangles only) offset inward along face normals.
+
+    For frontend rendering: the PC inner layer is placed 1 mm inside the
+    glass surface so it appears as translucent coating behind the glass.
+    """
+    from annieray.materials import classify_pmt_body, classify_pmt_hardware
+    from annieray.materials import MaterialID
+
+    if type_name == "hw":
+        return b""
+
+    tris = flat_verts.reshape(-1, 3, 3)
+    mat_ids = classify_pmt_body(tris, type_name)
+    mask = mat_ids == int(MaterialID.PHOTOCATHODE)
+    tri_idx = np.where(mask)[0]
+    n = len(tri_idx)
+    if n == 0:
+        return b""
+
+    # Fetch all vertices for PC triangles
+    idx = np.repeat(tri_idx * 3, 3) + np.tile(np.arange(3), n)
+    verts = flat_verts[idx].copy()
+
+    # Face normals (outward)
+    v0 = flat_verts[tri_idx * 3]
+    v1 = flat_verts[tri_idx * 3 + 1]
+    v2 = flat_verts[tri_idx * 3 + 2]
+    normals = np.cross(v1 - v0, v2 - v0)
+    nlen = np.linalg.norm(normals, axis=1, keepdims=True)
+    nlen[nlen == 0] = 1
+    normals /= nlen
+
+    # Offset inward: subtract normal * offset
+    verts -= np.repeat(normals * offset_mm, 3, axis=0)
+    return verts.tobytes()
+
+
+def _build_pvc_sub_mesh(flat_verts: np.ndarray, type_name: str,
+                         type_idx: int) -> bytes:
+    """Build PVC sub-mesh for LUX/ETEL housing and wing triangles."""
+    from annieray.materials import classify_pmt_body
+    from annieray.materials import MaterialID
+
+    if type_name == "hw":
+        return b""
+    tris = flat_verts.reshape(-1, 3, 3)
+    mat_ids = classify_pmt_body(tris, type_name)
+    mask = mat_ids == int(MaterialID.PVC)
+    tri_idx = np.where(mask)[0]
+    n = len(tri_idx)
+    if n == 0:
+        return b""
+    idx = np.repeat(tri_idx * 3, 3) + np.tile(np.arange(3), n)
+    return flat_verts[idx].copy().tobytes()
+
+
 # Pre-parse single-instance PMT assembly meshes.
 # Keys align with PMT_MESH_TYPE in pmt_loader.py:
 #   0 = LUX (lux_bottom),  1 = ETEL (etel_top),
@@ -57,6 +154,11 @@ def _parse_gdml_flattened(path: Path, recenter=True):
 # Each GDML file is a single tessellated PMT assembly (merged by extraction,
 # but there are no physvol — the "count" in metadata is the detector count).
 PMT_MESH_CACHE: dict[int, bytes] = {}
+PMT_COLOR_CACHE: dict[int, bytes] = {}
+PMT_MESH_PC_CACHE: dict[int, bytes] = {}
+PMT_MESH_PVC_CACHE: dict[int, bytes] = {}
+# Type-name mapping for classification: 0-3 → body type, 4-5 → "hw"
+PMT_MESH_TYPE_NAMES = ["LUX", "ETEL", "Hamamatsu", "Watchboy", "hw", "hw"]
 for _mi, _gn, _rc in [(0, "pmt_lux_bottom.gdml", True),
                        (1, "pmt_etel_top.gdml", True),
                        (2, "pmt_8inch_body.gdml", False),
@@ -67,7 +169,13 @@ for _mi, _gn, _rc in [(0, "pmt_lux_bottom.gdml", True),
     if _p.exists():
         _d, _nv = _parse_gdml_flattened(_p, recenter=_rc)
         PMT_MESH_CACHE[_mi] = _d
-        print(f"  PMT mesh {_mi} ({_gn}): {_nv // 3} tris")
+        _flat = np.frombuffer(_d, dtype=np.float32).reshape(-1, 3)
+        PMT_COLOR_CACHE[_mi] = _build_color_buffer(_flat, PMT_MESH_TYPE_NAMES[_mi], _mi)
+        PMT_MESH_PC_CACHE[_mi] = _build_pc_sub_mesh(_flat, PMT_MESH_TYPE_NAMES[_mi], _mi)
+        PMT_MESH_PVC_CACHE[_mi] = _build_pvc_sub_mesh(_flat, PMT_MESH_TYPE_NAMES[_mi], _mi)
+        print(f"  PMT mesh {_mi} ({_gn}): {_nv // 3} tris"
+              f" (PC sub: {len(PMT_MESH_PC_CACHE[_mi]) // 36} tris,"
+              f" PVC sub: {len(PMT_MESH_PVC_CACHE[_mi]) // 36} tris)")
     else:
         print(f"  PMT mesh {_mi} ({_gn}): NOT FOUND")
 
@@ -140,6 +248,12 @@ class VizHandler(BaseHTTPRequestHandler):
             self._send_detectors()
         elif path.startswith("/api/pmt_mesh/"):
             self._send_pmt_mesh(path)
+        elif path.startswith("/api/pmt_mesh_pc/"):
+            self._send_pmt_mesh_pc(path)
+        elif path.startswith("/api/pmt_mesh_pvc/"):
+            self._send_pmt_mesh_pvc(path)
+        elif path.startswith("/api/pmt_mesh_colors/"):
+            self._send_pmt_mesh_colors(path)
         elif path == "/api/scan_mesh/list":
             self._send_scan_mesh_list()
         elif path.startswith("/api/scan_mesh/"):
@@ -317,6 +431,42 @@ class VizHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "mesh type not available"}, 404)
             return
         self._send_binary(data)
+
+    def _send_pmt_mesh_pc(self, path):
+        try:
+            type_idx = int(path.split("/")[-1])
+        except (ValueError, IndexError):
+            self._send_json({"error": "invalid type"}, 400)
+            return
+        data = PMT_MESH_PC_CACHE.get(type_idx)
+        if data is None or len(data) == 0:
+            self._send_json({"error": "no PC sub-mesh for this type"}, 404)
+            return
+        self._send_binary(data)
+
+    def _send_pmt_mesh_pvc(self, path):
+        try:
+            type_idx = int(path.split("/")[-1])
+        except (ValueError, IndexError):
+            self._send_json({"error": "invalid type"}, 400)
+            return
+        data = PMT_MESH_PVC_CACHE.get(type_idx)
+        if data is None or len(data) == 0:
+            self._send_json({"error": "no PVC sub-mesh for this type"}, 404)
+            return
+        self._send_binary(data)
+
+    def _send_pmt_mesh_colors(self, path):
+        try:
+            type_idx = int(path.split("/")[-1])
+        except (ValueError, IndexError):
+            self._send_json({"error": "invalid type"}, 400)
+            return
+        data = PMT_COLOR_CACHE.get(type_idx)
+        if data is None:
+            self._send_json({"error": "mesh type not available"}, 404)
+            return
+        self._send_binary(data, content_type="application/octet-stream")
 
     def _send_scan_mesh_list(self):
         names = sorted(SCAN_MESH_CACHE.keys())
@@ -980,20 +1130,46 @@ async function init() {
         const pmtData = await loadPMTs();
 
         // Load PMT mesh geometries for needed types
-        const meshGeos = {};
+        const meshGeos = {};       // glass outer shell (full mesh)
+        const meshPcGeos = {};     // PC inner layer (brown, 1 mm inside glass)
+        const meshPvcGeos = {};    // PVC housing/wings (dark grey)
         const hwMeshGeos = {};
         const neededTypes = new Set(pmtData.mesh_types || []);
         const neededHwTypes = new Set((pmtData.hw_mesh_types || []).filter(v => v >= 0));
         for (const mt of neededTypes) {
             try {
-                const resp = await fetch(`/api/pmt_mesh/${mt}`);
-                if (resp.ok) {
-                    const buf = await resp.arrayBuffer();
+                const meshResp = await fetch(`/api/pmt_mesh/${mt}`);
+                if (meshResp.ok) {
+                    const buf = await meshResp.arrayBuffer();
                     const flat = new Float32Array(buf);
                     const geo = new THREE.BufferGeometry();
                     geo.setAttribute('position', new THREE.BufferAttribute(flat, 3));
                     geo.computeVertexNormals();
                     meshGeos[mt] = geo;
+                }
+                // PC sub-mesh (translucent brown inner layer)
+                const pcResp = await fetch(`/api/pmt_mesh_pc/${mt}`);
+                if (pcResp.ok) {
+                    const buf = await pcResp.arrayBuffer();
+                    if (buf.byteLength > 0) {
+                        const flat = new Float32Array(buf);
+                        const geo = new THREE.BufferGeometry();
+                        geo.setAttribute('position', new THREE.BufferAttribute(flat, 3));
+                        geo.computeVertexNormals();
+                        meshPcGeos[mt] = geo;
+                    }
+                }
+                // PVC sub-mesh (dark grey housing / wings)
+                const pvcResp = await fetch(`/api/pmt_mesh_pvc/${mt}`);
+                if (pvcResp.ok) {
+                    const buf = await pvcResp.arrayBuffer();
+                    if (buf.byteLength > 0) {
+                        const flat = new Float32Array(buf);
+                        const geo = new THREE.BufferGeometry();
+                        geo.setAttribute('position', new THREE.BufferAttribute(flat, 3));
+                        geo.computeVertexNormals();
+                        meshPvcGeos[mt] = geo;
+                    }
                 }
             } catch (e) {
                 console.warn(`No mesh for type ${mt}`);
@@ -1001,12 +1177,20 @@ async function init() {
         }
         for (const mt of neededHwTypes) {
             try {
-                const resp = await fetch(`/api/pmt_mesh/${mt}`);
-                if (resp.ok) {
-                    const buf = await resp.arrayBuffer();
+                const [meshResp, colResp] = await Promise.all([
+                    fetch(`/api/pmt_mesh/${mt}`),
+                    fetch(`/api/pmt_mesh_colors/${mt}`),
+                ]);
+                if (meshResp.ok) {
+                    const buf = await meshResp.arrayBuffer();
                     const flat = new Float32Array(buf);
                     const geo = new THREE.BufferGeometry();
                     geo.setAttribute('position', new THREE.BufferAttribute(flat, 3));
+                    if (colResp.ok) {
+                        const colBuf = await colResp.arrayBuffer();
+                        const colors = new Uint8Array(colBuf);
+                        geo.setAttribute('color', new THREE.BufferAttribute(colors, 4, true));
+                    }
                     geo.computeVertexNormals();
                     hwMeshGeos[mt] = geo;
                 }
@@ -1015,9 +1199,48 @@ async function init() {
             }
         }
 
-        // Render PMTs
+        // Render PMTs — dual-layer: glass outer shell + PC inner coating
         pmtGroup = new THREE.Group();
         pmtHWGroup = new THREE.Group();
+
+        // Materials (cloned per-PMT so grey/opacity toggles work individually)
+        function makeGlassMat() {
+            return new THREE.MeshPhysicalMaterial({
+                color: new THREE.Color(0.97, 0.97, 0.99),  // faint cool white
+                roughness: 0.0,
+                metalness: 0.0,
+                transparent: true,
+                opacity: 1.0,
+                side: THREE.DoubleSide,
+                envMap: scene.environment,
+                envMapIntensity: 1.8,
+                depthWrite: false,
+                transmission: 0.92,
+                thickness: 0.5,
+                ior: 1.5,
+            });
+        }
+        function makePcMat() {
+            return new THREE.MeshPhysicalMaterial({
+                color: new THREE.Color(0.55, 0.20, 0.10),  // warm brown
+                roughness: 0.4,
+                metalness: 0.0,
+                transparent: true,
+                opacity: 0.35,   // thin-film PC — subtle tint through glass
+                side: THREE.DoubleSide,
+                depthWrite: true,
+            });
+        }
+        function makePvcMat() {
+            return new THREE.MeshPhysicalMaterial({
+                color: new THREE.Color(0.10, 0.10, 0.12),  // dark grey
+                roughness: 0.8,
+                metalness: 0.0,
+                side: THREE.DoubleSide,
+                depthWrite: true,
+            });
+        }
+
         for (let i = 0; i < pmtData.centers.length; i++) {
             const c = pmtData.centers[i];
             const r = pmtData.radii[i];
@@ -1029,31 +1252,61 @@ async function init() {
             const geo = meshGeos[mt];
 
             if (geo) {
-                const mat = new THREE.MeshPhysicalMaterial({
-                    color: color,
-                    roughness: 0.3,
-                    metalness: 0.0,
-                    transparent: true,
-                    opacity: 0.85,
-                    side: THREE.DoubleSide,
-                });
-                const mesh = new THREE.Mesh(geo, mat);
                 const ip = pmtData.instance_positions[i];
-                mesh.position.set(ip[0], ip[1], ip[2]);
                 const q = pmtData.quaternions[i];
-                mesh.quaternion.set(q[0], q[1], q[2], q[3]);
-                mesh.castShadow = true;
-                mesh.receiveShadow = true;
-                mesh.userData.pmtIdx = i;
-                mesh.userData.tubeId = pmtData.detector_nums[i];
-                pmtGroup.add(mesh);
+
+                // Glass outer shell (transparent, reflective)
+                const glassMat = makeGlassMat();
+                const glassMesh = new THREE.Mesh(geo, glassMat);
+                glassMesh.position.set(ip[0], ip[1], ip[2]);
+                glassMesh.quaternion.set(q[0], q[1], q[2], q[3]);
+                glassMesh.castShadow = true;
+                glassMesh.receiveShadow = true;
+                glassMesh.renderOrder = 1;
+                glassMesh.userData.pmtIdx = i;
+                glassMesh.userData.tubeId = pmtData.detector_nums[i];
+                pmtGroup.add(glassMesh);
+
+                // PC inner layer (brown, offset 1 mm inside glass)
+                const pcGeo = meshPcGeos[mt];
+                if (pcGeo) {
+                    const pcMatMesh = makePcMat();
+                    const pcMesh = new THREE.Mesh(pcGeo, pcMatMesh);
+                    pcMesh.position.set(ip[0], ip[1], ip[2]);
+                    pcMesh.quaternion.set(q[0], q[1], q[2], q[3]);
+                    pcMesh.castShadow = true;
+                    pcMesh.receiveShadow = true;
+                    pcMesh.renderOrder = 0;
+                    pcMesh.userData.pmtIdx = i;
+                    pcMesh.userData.tubeId = pmtData.detector_nums[i];
+                    pcMesh.userData.isPC = true;
+                    pmtGroup.add(pcMesh);
+                }
+
+                // PVC housing / wings (dark grey, only LUX/ETEL have these)
+                const pvcGeo = meshPvcGeos[mt];
+                if (pvcGeo) {
+                    const pvcMat = makePvcMat();
+                    const pvcMesh = new THREE.Mesh(pvcGeo, pvcMat);
+                    pvcMesh.position.set(ip[0], ip[1], ip[2]);
+                    pvcMesh.quaternion.set(q[0], q[1], q[2], q[3]);
+                    pvcMesh.castShadow = true;
+                    pvcMesh.receiveShadow = true;
+                    pvcMesh.renderOrder = 2;
+                    pvcMesh.userData.pmtIdx = i;
+                    pvcMesh.userData.tubeId = pmtData.detector_nums[i];
+                    pvcMesh.userData.isPVC = true;
+                    pmtGroup.add(pvcMesh);
+                }
 
                 // Hardware mesh at same position/orientation
                 const hwmt = pmtData.hw_mesh_types ? pmtData.hw_mesh_types[i] : -1;
                 const hwGeo = hwMeshGeos[hwmt];
                 if (hwGeo) {
+                    const hwHasColors = hwGeo.getAttribute('color') != null;
                     const hwMat = new THREE.MeshPhysicalMaterial({
-                        color: 0x887766,
+                        color: hwHasColors ? 0xffffff : 0x887766,
+                        vertexColors: hwHasColors,
                         roughness: 0.5,
                         metalness: 0.3,
                         transparent: true,
@@ -1314,16 +1567,23 @@ async function init() {
 
         pmtGreyCheck.addEventListener('change', () => {
             const isGrey = pmtGreyCheck.checked;
-            const col = isGrey ? 0x999999 : null;
             pmtGroup.children.forEach(child => {
                 if (child.isMesh && child.material) {
-                    if (col) {
-                        child.material.color.setHex(col);
+                    const idx = child.userData.pmtIdx;
+                    if (idx === undefined) return;
+                    if (isGrey) {
+                        child.material.color.setHex(0x999999);
+                        if (!child.userData.isPC && !child.userData.isPVC) {
+                            child.material.transmission = 0.0;
+                        }
                     } else {
-                        // Restore per-type colour from stored data
-                        const idx = child.userData.pmtIdx;
-                        if (idx !== undefined) {
-                            child.material.color.setHex(PMT_COLORS[pmtData.types[idx]] || 0x999999);
+                        if (child.userData.isPC) {
+                            child.material.color.setRGB(0.55, 0.20, 0.10);
+                        } else if (child.userData.isPVC) {
+                            child.material.color.setRGB(0.10, 0.10, 0.12);
+                        } else {
+                            child.material.color.setRGB(0.97, 0.97, 0.99);
+                            child.material.transmission = 0.92;
                         }
                     }
                 }
@@ -1459,7 +1719,13 @@ async function init() {
             const op = parseFloat(pmtOpacitySlider.value);
             pmtGroup.children.forEach(child => {
                 if (child.isMesh && child.material) {
-                    child.material.opacity = op;
+                    if (child.userData.isPC) {
+                        child.material.opacity = 0.35;
+                    } else if (child.userData.isPVC) {
+                        child.material.opacity = 1.0;
+                    } else {
+                        child.material.opacity = op;
+                    }
                 }
             });
             pmtHWGroup.children.forEach(child => {
@@ -1809,6 +2075,7 @@ def run_server(args):
         z_offset=args.z_offset,
         lappd_model=args.lappd_model,
         bottom_rotation_deg=args.bottom_rot,
+        bottom_spin_deg=args.bottom_spin,
         det_rotation_deg=args.det_rotation,
     )
     print(f"  Mesh: {geometry.mesh_vertices.shape[0]} verts, {geometry.mesh_triangles.shape[0]} tris")
@@ -1817,6 +2084,7 @@ def run_server(args):
     from annieray.pmt_loader import load_pmts
     pmt_info = load_pmts(pmt_csv, z_offset=args.z_offset,
                          bottom_rotation_deg=args.bottom_rot,
+                         bottom_spin_deg=args.bottom_spin,
                          det_rotation_deg=args.det_rotation)
     VizHandler._pmt_types = pmt_info["types"]
     VizHandler._pmt_data = pmt_info
