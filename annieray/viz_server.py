@@ -21,6 +21,7 @@ from urllib.parse import urlparse, parse_qs
 
 import numpy as np
 
+from annieray.pmt_loader import rotate_z
 from annieray.tracer import build_geometry, trace_cherenkov
 
 geometry = None
@@ -1813,7 +1814,7 @@ def run_server(args):
     print(f"  Mesh: {geometry.mesh_vertices.shape[0]} verts, {geometry.mesh_triangles.shape[0]} tris")
     print(f"  PMTs: {geometry.pmt_centers.shape[0]}")
 
-    from annieray.pmt_loader import load_pmts, rotate_z
+    from annieray.pmt_loader import load_pmts
     pmt_info = load_pmts(pmt_csv, z_offset=args.z_offset,
                          bottom_rotation_deg=args.bottom_rot,
                          det_rotation_deg=args.det_rotation)
