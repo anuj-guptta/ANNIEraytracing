@@ -22,7 +22,7 @@ from urllib.parse import urlparse, parse_qs
 import numpy as np
 
 from annieray.pmt_loader import rotate_z
-from annieray.tracer import build_geometry, trace_cherenkov
+from annieray.tracer import build_geometry, trace_cherenkov, reload_lappd_corrections
 
 geometry = None
 
@@ -206,6 +206,7 @@ class VizHandler(BaseHTTPRequestHandler):
     _pmt_data = None
     _corrections: dict[int, tuple[float, float, float]] = {}
     _corr_path: Path | None = None
+    _lappd_corr_path: str | None = None
 
     def log_message(self, fmt, *args):
         pass  # quiet
@@ -244,6 +245,8 @@ class VizHandler(BaseHTTPRequestHandler):
             self._handle_trace(params)
         elif path == "/api/housing":
             self._send_lappd_housing()
+        elif path == "/api/lappd_correction":
+            self._send_lappd_correction()
         elif path == "/api/detectors":
             self._send_detectors()
         elif path.startswith("/api/pmt_mesh/"):
@@ -271,6 +274,8 @@ class VizHandler(BaseHTTPRequestHandler):
 
         if path == "/api/correction/save":
             self._save_correction(data)
+        elif path == "/api/lappd_correction":
+            self._save_lappd_correction(data)
         else:
             self.send_error(404)
 
@@ -335,6 +340,14 @@ class VizHandler(BaseHTTPRequestHandler):
         positions[idx, 1] += dy - old[1]
         positions[idx, 2] += dz - old[2]
 
+        # Apply same delta to kernel geometry so mesh refinement finds corrected positions
+        geometry.pmt_instance_pos[idx, 0] += dx - old[0]
+        geometry.pmt_instance_pos[idx, 1] += dy - old[1]
+        geometry.pmt_instance_pos[idx, 2] += dz - old[2]
+        geometry.pmt_centers[idx, 0] += dx - old[0]
+        geometry.pmt_centers[idx, 1] += dy - old[1]
+        geometry.pmt_centers[idx, 2] += dz - old[2]
+
         self._send_json({
             "success": True,
             "tube_id": tube_id,
@@ -361,6 +374,40 @@ class VizHandler(BaseHTTPRequestHandler):
                 "pc_half": [ad[6]],
             },
         })
+
+    def _send_lappd_correction(self):
+        if not self._lappd_corr_path or not os.path.exists(self._lappd_corr_path):
+            self._send_json({"corrections": [{"idx": 0, "dx": 0, "dy": 0, "dz": 0}]})
+            return
+        with open(self._lappd_corr_path, newline="") as f:
+            rows = list(csv.DictReader(f))
+        self._send_json({"corrections": rows})
+
+    def _save_lappd_correction(self, data):
+        idx = int(data.get("idx", 0))
+        dx = float(data.get("dx", 0))
+        dy = float(data.get("dy", 0))
+        dz = float(data.get("dz", 0))
+        if not self._lappd_corr_path:
+            self._send_json({"error": "no LAPPD correction path"}, 400)
+            return
+        corrected = False
+        rows = []
+        if os.path.exists(self._lappd_corr_path):
+            with open(self._lappd_corr_path, newline="") as f:
+                for row in csv.DictReader(f):
+                    if int(row["idx"]) == idx:
+                        row["dx"], row["dy"], row["dz"] = str(dx), str(dy), str(dz)
+                        corrected = True
+                    rows.append(row)
+        if not corrected:
+            rows.append({"idx": str(idx), "dx": str(dx), "dy": str(dy), "dz": str(dz)})
+        with open(self._lappd_corr_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["idx", "dx", "dy", "dz"])
+            for r in rows:
+                w.writerow([r["idx"], r["dx"], r["dy"], r["dz"]])
+        self._send_json({"status": "ok"})
 
     def _send_detectors(self):
         dets = []
@@ -513,6 +560,7 @@ class VizHandler(BaseHTTPRequestHandler):
 
         rng = np.random.default_rng()
         t0 = time.time()
+        reload_lappd_corrections(geometry)
         hits = trace_cherenkov(
             (mx, my, mz), (dx, dy, dz), n, geometry, rng=rng,
         )
@@ -624,10 +672,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <label>Ambient <span id="ambientVal">0.50</span>
     <input type="range" id="ambient" min="0" max="2.0" step="0.01" value="0.50"></label>
   <hr style="margin:8px 0;border:none;border-top:1px solid rgba(0,0,0,0.1);">
-  <label>LAPPD Radial <span id="lappdRadialVal">-62</span>
-    <input type="range" id="lappdRadial" min="-200" max="200" step="1" value="-62"></label>
-  <label>LAPPD Vertical <span id="lappdVertVal">740</span>
-    <input type="range" id="lappdVert" min="-1000" max="1000" step="5" value="740"></label>
+  <label>LAPPD dx <input type="number" id="lappdDx" step="1" value="0" style="width:70px;"></label>
+  <label>LAPPD dy <input type="number" id="lappdDy" step="1" value="0" style="width:70px;"></label>
+  <label>LAPPD dz <input type="number" id="lappdDz" step="1" value="0" style="width:70px;"></label>
+  <button id="saveLappdCorr">Save Correction</button>
   <button id="focusLAPPD" disabled>Focus on LAPPD</button>
   <label style="margin-top:6px;"><input type="checkbox" id="lappdGrey"> Grey LAPPD</label>
   <hr style="margin:8px 0;border:none;border-top:1px solid rgba(0,0,0,0.1);">
@@ -1455,7 +1503,6 @@ async function init() {
         if (!Array.isArray(housingData.housing)) {
             const h = housingData.housing;
             const origCenter = new THREE.Vector3(h.center[0], h.center[1], h.center[2]);
-            const origR = Math.hypot(origCenter.x, origCenter.y);
             const origPC = new THREE.Vector3(h.pc_center[0], h.pc_center[1], h.pc_center[2]);
 
             // Housing box
@@ -1498,31 +1545,48 @@ async function init() {
             pcMesh.receiveShadow = true;
             scene.add(pcMesh);
 
-            // LAPPD position sliders
-            const radialSlider = document.getElementById('lappdRadial');
-            const vertSlider = document.getElementById('lappdVert');
-            const radialVal = document.getElementById('lappdRadialVal');
-            const vertVal = document.getElementById('lappdVertVal');
+            // LAPPD global dx/dy/dz corrections
+            const dxInput = document.getElementById('lappdDx');
+            const dyInput = document.getElementById('lappdDy');
+            const dzInput = document.getElementById('lappdDz');
+            const saveBtn = document.getElementById('saveLappdCorr');
 
-            function updateHousing() {
-                const dr = parseFloat(radialSlider.value);
-                const dz = parseFloat(vertSlider.value);
+            // Load current correction from server
+            const corrResp = await fetch('/api/lappd_correction');
+            const corrData = await corrResp.json();
+            let lappdCorr = {dx: 0, dy: 0, dz: 0};
+            if (corrData.corrections && corrData.corrections.length > 0) {
+                const c = corrData.corrections[0];
+                lappdCorr = {dx: parseFloat(c.dx), dy: parseFloat(c.dy), dz: parseFloat(c.dz)};
+            }
+            dxInput.value = lappdCorr.dx;
+            dyInput.value = lappdCorr.dy;
+            dzInput.value = lappdCorr.dz;
 
-                const scale = (origR + dr) / origR;
-                const pos = origCenter.clone().multiplyScalar(scale);
-                pos.z = origCenter.z + dz;
-                boxMesh.position.copy(pos);
-
-                const pcPos = origPC.clone().multiplyScalar(scale);
-                pcPos.z = origPC.z + dz;
-                pcMesh.position.copy(pcPos);
-
-                radialVal.textContent = dr;
-                vertVal.textContent = dz;
+            function applyLappdCorrection() {
+                const dx = parseFloat(dxInput.value) || 0;
+                const dy = parseFloat(dyInput.value) || 0;
+                const dz = parseFloat(dzInput.value) || 0;
+                boxMesh.position.set(origCenter.x + dx, origCenter.y + dy, origCenter.z + dz);
+                pcMesh.position.set(origPC.x + dx, origPC.y + dy, origPC.z + dz);
             }
 
-            radialSlider.addEventListener('input', updateHousing);
-            vertSlider.addEventListener('input', updateHousing);
+            applyLappdCorrection();
+
+            saveBtn.addEventListener('click', async () => {
+                const body = JSON.stringify({
+                    idx: 0,
+                    dx: parseFloat(dxInput.value) || 0,
+                    dy: parseFloat(dyInput.value) || 0,
+                    dz: parseFloat(dzInput.value) || 0,
+                });
+                await fetch('/api/lappd_correction', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body,
+                });
+                applyLappdCorrection();
+            });
 
             // Grey LAPPD checkbox
             const greyCheck = document.getElementById('lappdGrey');
@@ -2093,6 +2157,7 @@ def run_server(args):
     # ---- Apply corrections to simulated PMT positions ----
     _corr_path = Path(__file__).resolve().parent.parent / "corrections.csv"
     VizHandler._corr_path = _corr_path
+    VizHandler._lappd_corr_path = str(Path(__file__).resolve().parent / "lappd_corrections.csv")
     _corrections: dict[int, tuple[float, float, float]] = {}
     if _corr_path.exists():
         with open(_corr_path, newline="") as _f:
@@ -2119,6 +2184,13 @@ def run_server(args):
                 _positions[_i, 0] += _dx
                 _positions[_i, 1] += _dy
                 _positions[_i, 2] += _dz
+                # Apply same delta to kernel geometry (mesh refinement + sphere fallback)
+                geometry.pmt_instance_pos[_i, 0] += _dx
+                geometry.pmt_instance_pos[_i, 1] += _dy
+                geometry.pmt_instance_pos[_i, 2] += _dz
+                geometry.pmt_centers[_i, 0] += _dx
+                geometry.pmt_centers[_i, 1] += _dy
+                geometry.pmt_centers[_i, 2] += _dz
                 _applied += 1
         print(f"  Corrections applied to {_applied} PMT instance positions")
     else:

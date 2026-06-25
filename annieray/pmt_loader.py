@@ -302,6 +302,10 @@ def load_pmts(scan_path: Path, z_offset: float = 0.0,
         r = radii[i]
         instance_positions[i] = [centers[i][j] + (r - off) * tgt[j] for j in range(3)]
 
+    rotmats = np.zeros((n, 9), dtype=np.float32)
+    for i in range(n):
+        rotmats[i] = quat_to_rotmat(quaternions[i])
+
     return {
         "centers": centers,
         "radii": radii,
@@ -312,7 +316,27 @@ def load_pmts(scan_path: Path, z_offset: float = 0.0,
         "mesh_types": mesh_type_indices,
         "quaternions": quaternions,
         "instance_positions": instance_positions,
+        "rotmats": rotmats,
     }
+
+
+def quat_to_rotmat(q: np.ndarray) -> np.ndarray:
+    """Convert (4,) quaternion (x,y,z,w) to flattened 3×3 R^T (row-major, 9 floats).
+
+    The returned matrix R^T transforms global vectors to the mesh local frame
+    (v_local = R^T · v_global).  The kernel stores these 9 floats per PMT for
+    efficient local-frame ray transformation.
+    """
+    x, y, z, w = q
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    R = np.array([
+        [1.0 - 2.0 * (yy + zz), 2.0 * (xy - wz), 2.0 * (xz + wy)],
+        [2.0 * (xy + wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz - wx)],
+        [2.0 * (xz - wy), 2.0 * (yz + wx), 1.0 - 2.0 * (xx + yy)],
+    ], dtype=np.float64)
+    return R.T.flatten().astype(np.float32)
 
 
 def _forward_to_quat(forward: np.ndarray, target: np.ndarray) -> np.ndarray:

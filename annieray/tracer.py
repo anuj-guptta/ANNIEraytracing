@@ -1,5 +1,7 @@
 """GPU-accelerated analytic ray tracer using Taichi."""
 
+import csv
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -9,6 +11,7 @@ import taichi as ti
 
 from annieray import gdml_parser, step_parser
 from annieray import pmt_loader
+from annieray import pmt_mesh
 from annieray.step_parser import LAPPD_HALF_SIZE
 
 
@@ -92,6 +95,61 @@ class Geometry:
 
     # ---- Per-triangle material IDs for structure mesh ----
     mesh_material_ids: np.ndarray | None = None  # (M,) int32 — MaterialID per tri
+
+    # ---- PMT body meshes (triangle soup per instance type, local frame) ----
+    pmt_body_tris: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 9), dtype=np.float32)
+    )  # (T_global, 9) float32 — 3 vertices per row, local frame
+    pmt_body_mat_ids: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int32)
+    )  # (T_global,) int32 — MaterialID per triangle
+    pmt_body_offsets: np.ndarray = field(
+        default_factory=lambda: np.array([0, 0, 0, 0, 0], dtype=np.int32)
+    )  # (5,) int32 — start index per mesh type 0-3 + sentinel
+
+    # ---- Per-PMT instance data for mesh refinement ----
+    pmt_rotmats: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 9), dtype=np.float32)
+    )  # (P, 9) float32 — flattened R^T for local-frame transform
+    pmt_mesh_types: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int32)
+    )  # (P,) int32 — mesh type index per PMT
+    pmt_instance_pos: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 3), dtype=np.float32)
+    )  # (P, 3) float32 — instance position (mesh centroid)
+    pmt_bounding_radii: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.float32)
+    )  # (P,) float32 — bounding sphere radius per instance
+
+    # ---- LAPPD correction state ----
+    lappd_corrections_baked: np.ndarray | None = None  # (1,3) float32 — last-applied dx,dy,dz
+
+
+def reload_lappd_corrections(geo: Geometry):
+    """Read lappd_corrections.csv and apply delta to housing/kernel data."""
+    corr_path = os.path.join(os.path.dirname(__file__), "lappd_corrections.csv")
+    if not os.path.exists(corr_path):
+        return
+    if geo.lappd_housing_data.shape[0] == 0:
+        return
+
+    new_corrs = np.zeros((1, 3), dtype=np.float32)
+    with open(corr_path) as f:
+        for row in csv.DictReader(f):
+            idx = int(row["idx"])
+            if idx == 0:
+                new_corrs[0] = [float(row["dx"]), float(row["dy"]), float(row["dz"])]
+
+    if geo.lappd_corrections_baked is None:
+        geo.lappd_corrections_baked = new_corrs.copy()
+        delta = new_corrs
+    else:
+        delta = new_corrs - geo.lappd_corrections_baked
+        geo.lappd_corrections_baked = new_corrs.copy()
+
+    if np.any(delta != 0.0):
+        geo.lappd_housing_data[0, 0:3] += delta[0]
+        geo.annie_lappd_data[0, 0:3] += delta[0]
 
 
 def build_geometry(
@@ -275,6 +333,40 @@ def build_geometry(
         annie_lappd_data=annie_lappd_data if annie_lappd_data.shape[0] > 0 else None,
     )
 
+    # ---- Stage 7: PMT body meshes and instance data (for mesh-based ray tracing) ----
+    pmt_body_tris = np.zeros((0, 9), dtype=np.float32)
+    pmt_body_mat_ids = np.zeros(0, dtype=np.int32)
+    pmt_body_offsets = np.array([0, 0, 0, 0, 0], dtype=np.int32)
+    pmt_rotmats_arr = np.zeros((0, 9), dtype=np.float32)
+    pmt_mesh_types_arr = np.zeros(0, dtype=np.int32)
+    pmt_instance_pos_arr = np.zeros((0, 3), dtype=np.float32)
+    pmt_bounding_radii_arr = np.zeros(0, dtype=np.float32)
+
+    if pmt_csv_path and pmt_csv_path.exists() and len(pmt_centers) > 0:
+        body_meshes = pmt_mesh.load_pmt_body_meshes()
+        pmt_body_tris, pmt_body_mat_ids, pmt_body_offsets = \
+            pmt_mesh.build_body_tris_arrays(body_meshes)
+
+        _mesh_types = pmt_data.get("mesh_types", np.zeros(len(pmt_centers), dtype=np.int32))
+        _rotmats = pmt_data.get("rotmats", np.zeros((len(pmt_centers), 9), dtype=np.float32))
+        _inst_pos = pmt_data.get("instance_positions",
+                                 np.zeros((len(pmt_centers), 3), dtype=np.float32))
+
+        pmt_mesh_types_arr = np.asarray(_mesh_types, dtype=np.int32)
+        pmt_rotmats_arr = np.asarray(_rotmats, dtype=np.float32)
+        pmt_instance_pos_arr = np.asarray(_inst_pos, dtype=np.float32)
+
+        pmt_bounding_radii_arr = np.zeros(len(pmt_centers), dtype=np.float32)
+        for i in range(len(pmt_centers)):
+            mt = int(pmt_mesh_types_arr[i])
+            md = body_meshes.get(mt)
+            pmt_bounding_radii_arr[i] = md.bounding_radius if md is not None else 0.0
+
+        n_loaded = sum(1 for v in body_meshes.values() if v is not None)
+        print(f"  PMT body meshes: {n_loaded}/4 types loaded, "
+              f"{pmt_body_tris.shape[0]} total tris, "
+              f"{len(pmt_centers)} instances")
+
     # Default: all structure mesh triangles are TEFLON (ID 4)
     n_tris = tris.shape[0]
     mesh_material_ids = np.full(n_tris, 4, dtype=np.int32) if n_tris > 0 else np.zeros(0, dtype=np.int32)
@@ -294,6 +386,13 @@ def build_geometry(
         lappd_housing_data=lappd_housing_data,
         annie_lappd_data=annie_lappd_data,
         detectors=detectors,
+        pmt_body_tris=pmt_body_tris,
+        pmt_body_mat_ids=pmt_body_mat_ids,
+        pmt_body_offsets=pmt_body_offsets,
+        pmt_rotmats=pmt_rotmats_arr,
+        pmt_mesh_types=pmt_mesh_types_arr,
+        pmt_instance_pos=pmt_instance_pos_arr,
+        pmt_bounding_radii=pmt_bounding_radii_arr,
     )
 
 
@@ -687,11 +786,12 @@ def _lappd_local_coords(hx, hy, hz, lcx, lcy, lcz, sx, sy, sz, nx, ny, nz):
 #
 # Tracing order (later = higher priority for same t):
 #   1. Structure mesh (triangles)            → component_id = 1
-#   2. PMT spheres                           → component_id = 2
-#   3. Default LAPPD rectangles              → component_id = 3
-#   4. ANNIE housing box (absorbs side/back) → kills photon (component_id = 0)
-#   5. ANNIE LAPPD photocathode rectangle    → component_id = 3
-#   6. Tank wall (infinite cylinder)         → component_id = 4
+#   2. PMT spheres (fallback)                → component_id = 2
+#   3. PMT mesh refinement (override sphere) → component_id = 2
+#   4. Default LAPPD rectangles              → component_id = 3
+#   5. ANNIE housing box (absorbs side/back) → kills photon (component_id = 0)
+#   6. ANNIE LAPPD photocathode rectangle    → component_id = 3
+#   7. Tank wall (infinite cylinder)         → component_id = 4
 
 
 @ti.kernel
@@ -704,6 +804,13 @@ def trace_kernel(
     pmt_centers: ti.types.ndarray(ndim=2),
     pmt_radii: ti.types.ndarray(ndim=1),
     pmt_dirs: ti.types.ndarray(ndim=2),
+    pmt_body_tris: ti.types.ndarray(ndim=2),
+    pmt_body_mat_ids: ti.types.ndarray(ndim=1),
+    pmt_body_offsets: ti.types.ndarray(ndim=1),
+    pmt_rotmats: ti.types.ndarray(ndim=2),
+    pmt_mesh_types: ti.types.ndarray(ndim=1),
+    pmt_instance_pos: ti.types.ndarray(ndim=2),
+    pmt_bounding_radii: ti.types.ndarray(ndim=1),
     lappd_data: ti.types.ndarray(ndim=2),
     lappd_strip: ti.types.ndarray(ndim=2),
     tank_radius: ti.f32,
@@ -718,6 +825,7 @@ def trace_kernel(
     n_pmts = pmt_centers.shape[0]
     n_lappds = lappd_data.shape[0]
     n_housings = housing_data.shape[0]
+    n_body_tris = pmt_body_tris.shape[0]
 
     for i in range(n_rays):
         ox = origins[i, 0]
@@ -782,41 +890,161 @@ def trace_kernel(
                 best_mat = mesh_material_ids[t] if mesh_material_ids.shape[0] > 0 else 0
 
         for p in range(n_pmts):
-            pcx = pmt_centers[p, 0]
-            pcy = pmt_centers[p, 1]
-            pcz = pmt_centers[p, 2]
-            pr = pmt_radii[p]
+            # If this PMT has loaded mesh data, skip the analytic sphere entirely.
+            # The mesh refinement loop below will handle hit detection via a
+            # bounding-sphere pre-filter + local-frame triangle test.
+            pmt_mt = ti.cast(pmt_mesh_types[p], ti.i32)
+            has_mesh = 0
+            if n_body_tris > 0 and pmt_mt >= 0:
+                _s = pmt_body_offsets[pmt_mt]
+                _e = pmt_body_offsets[pmt_mt + 1]
+                if _e > _s and pmt_bounding_radii[p] > 0.0:
+                    has_mesh = 1
 
-            hit, t_hit, nx, ny, nz = _ray_sphere_intersect(
-                ox, oy, oz, dx, dy, dz,
-                pcx, pcy, pcz,
-                pr,
-            )
+            if not has_mesh:
+                pcx = pmt_centers[p, 0]
+                pcy = pmt_centers[p, 1]
+                pcz = pmt_centers[p, 2]
+                pr = pmt_radii[p]
 
-            if hit and t_hit > 1e-6 and t_hit < best_t:
-                hpx = ox + dx * t_hit - pcx
-                hpy = oy + dy * t_hit - pcy
-                hpz = oz + dz * t_hit - pcz
-                pdx = pmt_dirs[p, 0]
-                pdy = pmt_dirs[p, 1]
-                pdz = pmt_dirs[p, 2]
-                # Hemisphere check: dot(normal, direction) > 0 for front face
-                dot_fwd = hpx * pdx + hpy * pdy + hpz * pdz
-                if dot_fwd > 0.0:
-                    best_t = t_hit
-                    best_hit = CID_PMT
-                    best_x = ox + dx * t_hit
-                    best_y = oy + dy * t_hit
-                    best_z = oz + dz * t_hit
-                    best_nx = nx
-                    best_ny = ny
-                    best_nz = nz
-                    best_det_idx = p
-                    best_det_sys = DET_SYS_PMT
-                    theta, phi = _pmt_local_coords(nx, ny, nz, pdx, pdy, pdz)
-                    best_lu = theta
-                    best_lv = phi
-                    best_mat = 2  # PHOTOCATHODE (forward hemisphere)
+                hit, t_hit, nx, ny, nz = _ray_sphere_intersect(
+                    ox, oy, oz, dx, dy, dz,
+                    pcx, pcy, pcz,
+                    pr,
+                )
+
+                if hit and t_hit > 1e-6 and t_hit < best_t:
+                    hpx = ox + dx * t_hit - pcx
+                    hpy = oy + dy * t_hit - pcy
+                    hpz = oz + dz * t_hit - pcz
+                    pdx = pmt_dirs[p, 0]
+                    pdy = pmt_dirs[p, 1]
+                    pdz = pmt_dirs[p, 2]
+                    # Hemisphere check: dot(normal, direction) > 0 for front face
+                    dot_fwd = hpx * pdx + hpy * pdy + hpz * pdz
+                    if dot_fwd > 0.0:
+                        best_t = t_hit
+                        best_hit = CID_PMT
+                        best_x = ox + dx * t_hit
+                        best_y = oy + dy * t_hit
+                        best_z = oz + dz * t_hit
+                        best_nx = nx
+                        best_ny = ny
+                        best_nz = nz
+                        best_det_idx = p
+                        best_det_sys = DET_SYS_PMT
+                        theta, phi = _pmt_local_coords(nx, ny, nz, pdx, pdy, pdz)
+                        best_lu = theta
+                        best_lv = phi
+                        best_mat = 2  # PHOTOCATHODE (forward hemisphere)
+
+        # ---- PMT mesh refinement (override sphere hits with accurate mesh) ----
+        if n_body_tris > 0 and n_pmts > 0:
+            for p in range(n_pmts):
+                mt = ti.cast(pmt_mesh_types[p], ti.i32)
+                if mt < 0:
+                    continue
+                t_start = pmt_body_offsets[mt]
+                t_end = pmt_body_offsets[mt + 1]
+                if t_end <= t_start:
+                    continue
+
+                ipx = pmt_instance_pos[p, 0]
+                ipy = pmt_instance_pos[p, 1]
+                ipz = pmt_instance_pos[p, 2]
+                br = pmt_bounding_radii[p]
+                if br <= 0.0:
+                    continue
+
+                # Bounding sphere pre-filter (dir is normalized → a = 1)
+                ocx = ox - ipx
+                ocy = oy - ipy
+                ocz = oz - ipz
+                b_half = ocx * dx + ocy * dy + ocz * dz
+                c = ocx * ocx + ocy * ocy + ocz * ocz - br * br
+                disc = b_half * b_half - c
+                if disc < 0.0:
+                    continue
+                sqrt_disc = ti.sqrt(disc)
+                t0 = -b_half - sqrt_disc
+                t1 = -b_half + sqrt_disc
+                t_enter = t0 if t0 > 0.0 else t1
+                if t_enter < 1e-6 or t_enter >= best_t:
+                    continue
+
+                # Load rotation matrix (flattened R^T, row-major)
+                rm0 = pmt_rotmats[p, 0]
+                rm1 = pmt_rotmats[p, 1]
+                rm2 = pmt_rotmats[p, 2]
+                rm3 = pmt_rotmats[p, 3]
+                rm4 = pmt_rotmats[p, 4]
+                rm5 = pmt_rotmats[p, 5]
+                rm6 = pmt_rotmats[p, 6]
+                rm7 = pmt_rotmats[p, 7]
+                rm8 = pmt_rotmats[p, 8]
+
+                # Transform ray to local frame: v_local = R^T · v_global
+                lox = ocx * rm0 + ocy * rm1 + ocz * rm2
+                loy = ocx * rm3 + ocy * rm4 + ocz * rm5
+                loz = ocx * rm6 + ocy * rm7 + ocz * rm8
+
+                ldx = dx * rm0 + dy * rm1 + dz * rm2
+                ldy = dx * rm3 + dy * rm4 + dz * rm5
+                ldz = dx * rm6 + dy * rm7 + dz * rm8
+
+                for t in range(t_start, t_end):
+                    v0x = pmt_body_tris[t, 0]
+                    v0y = pmt_body_tris[t, 1]
+                    v0z = pmt_body_tris[t, 2]
+                    v1x = pmt_body_tris[t, 3]
+                    v1y = pmt_body_tris[t, 4]
+                    v1z = pmt_body_tris[t, 5]
+                    v2x = pmt_body_tris[t, 6]
+                    v2y = pmt_body_tris[t, 7]
+                    v2z = pmt_body_tris[t, 8]
+
+                    _hit, _t, _u, _v, _nx, _ny, _nz = _ray_triangle_intersect(
+                        lox, loy, loz, ldx, ldy, ldz,
+                        v0x, v0y, v0z,
+                        v1x, v1y, v1z,
+                        v2x, v2y, v2z,
+                    )
+
+                    if _hit and _t > 1e-6 and _t < best_t and pmt_body_mat_ids[t] == 2:
+                        # Hit position in local frame
+                        hx_l = lox + ldx * _t
+                        hy_l = loy + ldy * _t
+                        hz_l = loz + ldz * _t
+
+                        # Transform normal to world frame: n_world = R · n_local
+                        # R is (R^T)^T, stored as [rm0, rm3, rm6] row 0, etc.
+                        wnx = _nx * rm0 + _ny * rm3 + _nz * rm6
+                        wny = _nx * rm1 + _ny * rm4 + _nz * rm7
+                        wnz = _nx * rm2 + _ny * rm5 + _nz * rm8
+                        n_len = ti.sqrt(wnx * wnx + wny * wny + wnz * wnz)
+                        if n_len > 1e-12:
+                            wnx /= n_len
+                            wny /= n_len
+                            wnz /= n_len
+
+                        best_t = _t
+                        # World hit = instance_pos + R · h_local
+                        best_x = ipx + hx_l * rm0 + hy_l * rm3 + hz_l * rm6
+                        best_y = ipy + hx_l * rm1 + hy_l * rm4 + hz_l * rm7
+                        best_z = ipz + hx_l * rm2 + hy_l * rm5 + hz_l * rm8
+                        best_nx = wnx
+                        best_ny = wny
+                        best_nz = wnz
+                        best_hit = CID_PMT
+                        best_det_idx = p
+                        best_det_sys = DET_SYS_PMT
+                        best_mat = 2
+                        pdx = pmt_dirs[p, 0]
+                        pdy = pmt_dirs[p, 1]
+                        pdz = pmt_dirs[p, 2]
+                        theta, phi = _pmt_local_coords(wnx, wny, wnz, pdx, pdy, pdz)
+                        best_lu = theta
+                        best_lv = phi
 
         for l in range(n_lappds):
             lcx = lappd_data[l, 0]
@@ -976,6 +1204,13 @@ def trace_rays(
         geometry.pmt_centers,
         geometry.pmt_radii,
         geometry.pmt_directions,
+        geometry.pmt_body_tris,
+        geometry.pmt_body_mat_ids,
+        geometry.pmt_body_offsets,
+        geometry.pmt_rotmats,
+        geometry.pmt_mesh_types,
+        geometry.pmt_instance_pos,
+        geometry.pmt_bounding_radii,
         geometry.lappd_data,
         geometry.lappd_strip_axes,
         geometry.tank_radius,

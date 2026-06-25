@@ -24,6 +24,18 @@ PHASE2_INNER_STRUCTURE_closed.gdml
 # Scratch scripts
 analyze_step.py
 
+# Debug / scratch
+_debug_*
+extract_step_positions.py
+placed_tips.csv
+
+# Scan overlays (large binary files)
+scan files by part/
+
+# Runtime state (generated per-environment)
+annieray/lappd_corrections.csv
+annieray/cherenkov_old.py
+
 # IDE
 .vscode/
 .idea/
