@@ -107,19 +107,33 @@ class Geometry:
         default_factory=lambda: np.array([0, 0, 0, 0, 0], dtype=np.int32)
     )  # (5,) int32 — start index per mesh type 0-3 + sentinel
 
+    # ---- PMT hardware (holder) meshes ----
+    pmt_hw_tris: np.ndarray = field(
+        default_factory=lambda: np.zeros((0, 9), dtype=np.float32)
+    )  # (T_hw, 9) float32
+    pmt_hw_mat_ids: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int32)
+    )  # (T_hw,) int32 — MaterialID per triangle (TEFLON=4, ACRYLIC=5)
+    pmt_hw_offsets: np.ndarray = field(
+        default_factory=lambda: np.array([0, 0, 0], dtype=np.int32)
+    )  # (3,) int32 — start index for types 4, 5 + sentinel
+
     # ---- Per-PMT instance data for mesh refinement ----
     pmt_rotmats: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 9), dtype=np.float32)
     )  # (P, 9) float32 — flattened R^T for local-frame transform
     pmt_mesh_types: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.int32)
-    )  # (P,) int32 — mesh type index per PMT
+    )  # (P,) int32 — mesh type index per PMT (body)
+    pmt_hw_types: np.ndarray = field(
+        default_factory=lambda: np.zeros(0, dtype=np.int32)
+    )  # (P,) int32 — HW type index per PMT (-1=none, 4=8", 5=10")
     pmt_instance_pos: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 3), dtype=np.float32)
     )  # (P, 3) float32 — instance position (mesh centroid)
     pmt_bounding_radii: np.ndarray = field(
         default_factory=lambda: np.zeros(0, dtype=np.float32)
-    )  # (P,) float32 — bounding sphere radius per instance
+    )  # (P,) float32 — max(body, HW) bounding sphere radius
 
     # ---- LAPPD correction state ----
     lappd_corrections_baked: np.ndarray | None = None  # (1,3) float32 — last-applied dx,dy,dz
@@ -337,8 +351,12 @@ def build_geometry(
     pmt_body_tris = np.zeros((0, 9), dtype=np.float32)
     pmt_body_mat_ids = np.zeros(0, dtype=np.int32)
     pmt_body_offsets = np.array([0, 0, 0, 0, 0], dtype=np.int32)
+    pmt_hw_tris = np.zeros((0, 9), dtype=np.float32)
+    pmt_hw_mat_ids = np.zeros(0, dtype=np.int32)
+    pmt_hw_offsets = np.array([0, 0, 0], dtype=np.int32)
     pmt_rotmats_arr = np.zeros((0, 9), dtype=np.float32)
     pmt_mesh_types_arr = np.zeros(0, dtype=np.int32)
+    pmt_hw_types_arr = np.zeros(0, dtype=np.int32)
     pmt_instance_pos_arr = np.zeros((0, 3), dtype=np.float32)
     pmt_bounding_radii_arr = np.zeros(0, dtype=np.float32)
 
@@ -346,6 +364,10 @@ def build_geometry(
         body_meshes = pmt_mesh.load_pmt_body_meshes()
         pmt_body_tris, pmt_body_mat_ids, pmt_body_offsets = \
             pmt_mesh.build_body_tris_arrays(body_meshes)
+
+        hw_meshes = pmt_mesh.load_pmt_hw_meshes()
+        pmt_hw_tris, pmt_hw_mat_ids, pmt_hw_offsets = \
+            pmt_mesh.build_hw_tris_arrays(hw_meshes)
 
         _mesh_types = pmt_data.get("mesh_types", np.zeros(len(pmt_centers), dtype=np.int32))
         _rotmats = pmt_data.get("rotmats", np.zeros((len(pmt_centers), 9), dtype=np.float32))
@@ -356,16 +378,34 @@ def build_geometry(
         pmt_rotmats_arr = np.asarray(_rotmats, dtype=np.float32)
         pmt_instance_pos_arr = np.asarray(_inst_pos, dtype=np.float32)
 
+        # HW type per instance: Hamamatsu→4 (8" HW), Watchboy/Watchman→5 (10" HW)
+        pmt_hw_types_arr = np.full(len(pmt_centers), -1, dtype=np.int32)
+        for i in range(len(pmt_centers)):
+            mt = int(pmt_mesh_types_arr[i])
+            if mt == 2:
+                pmt_hw_types_arr[i] = 4
+            elif mt == 3:
+                pmt_hw_types_arr[i] = 5
+
+        # Bounding radius = max(body_br, hw_br) per instance
         pmt_bounding_radii_arr = np.zeros(len(pmt_centers), dtype=np.float32)
         for i in range(len(pmt_centers)):
             mt = int(pmt_mesh_types_arr[i])
             md = body_meshes.get(mt)
-            pmt_bounding_radii_arr[i] = md.bounding_radius if md is not None else 0.0
+            br = md.bounding_radius if md is not None else 0.0
+            hwmt = int(pmt_hw_types_arr[i])
+            if hwmt >= 0:
+                hw_md = hw_meshes.get(hwmt)
+                if hw_md is not None:
+                    br = max(br, hw_md.bounding_radius)
+            pmt_bounding_radii_arr[i] = br
 
         n_loaded = sum(1 for v in body_meshes.values() if v is not None)
         print(f"  PMT body meshes: {n_loaded}/4 types loaded, "
               f"{pmt_body_tris.shape[0]} total tris, "
               f"{len(pmt_centers)} instances")
+        if pmt_hw_tris.shape[0] > 0:
+            print(f"  PMT HW meshes: {pmt_hw_tris.shape[0]} total tris")
 
     # Default: all structure mesh triangles are TEFLON (ID 4)
     n_tris = tris.shape[0]
@@ -389,8 +429,12 @@ def build_geometry(
         pmt_body_tris=pmt_body_tris,
         pmt_body_mat_ids=pmt_body_mat_ids,
         pmt_body_offsets=pmt_body_offsets,
+        pmt_hw_tris=pmt_hw_tris,
+        pmt_hw_mat_ids=pmt_hw_mat_ids,
+        pmt_hw_offsets=pmt_hw_offsets,
         pmt_rotmats=pmt_rotmats_arr,
         pmt_mesh_types=pmt_mesh_types_arr,
+        pmt_hw_types=pmt_hw_types_arr,
         pmt_instance_pos=pmt_instance_pos_arr,
         pmt_bounding_radii=pmt_bounding_radii_arr,
     )
@@ -809,6 +853,10 @@ def trace_kernel(
     pmt_body_offsets: ti.types.ndarray(ndim=1),
     pmt_rotmats: ti.types.ndarray(ndim=2),
     pmt_mesh_types: ti.types.ndarray(ndim=1),
+    pmt_hw_types: ti.types.ndarray(ndim=1),
+    pmt_hw_tris: ti.types.ndarray(ndim=2),
+    pmt_hw_mat_ids: ti.types.ndarray(ndim=1),
+    pmt_hw_offsets: ti.types.ndarray(ndim=1),
     pmt_instance_pos: ti.types.ndarray(ndim=2),
     pmt_bounding_radii: ti.types.ndarray(ndim=1),
     lappd_data: ti.types.ndarray(ndim=2),
@@ -826,6 +874,7 @@ def trace_kernel(
     n_lappds = lappd_data.shape[0]
     n_housings = housing_data.shape[0]
     n_body_tris = pmt_body_tris.shape[0]
+    n_hw_tris = pmt_hw_tris.shape[0]
 
     for i in range(n_rays):
         ox = origins[i, 0]
@@ -1046,6 +1095,100 @@ def trace_kernel(
                         best_lu = theta
                         best_lv = phi
 
+        # ---- PMT hardware (holder) mesh refinement ----
+        if n_hw_tris > 0 and n_pmts > 0:
+            for p in range(n_pmts):
+                hwmt = ti.cast(pmt_hw_types[p], ti.i32)
+                if hwmt < 4:
+                    continue
+                hw_start = pmt_hw_offsets[hwmt - 4]
+                hw_end = pmt_hw_offsets[hwmt - 3]
+                if hw_end <= hw_start:
+                    continue
+
+                ipx = pmt_instance_pos[p, 0]
+                ipy = pmt_instance_pos[p, 1]
+                ipz = pmt_instance_pos[p, 2]
+                br = pmt_bounding_radii[p]
+                if br <= 0.0:
+                    continue
+
+                ocx = ox - ipx
+                ocy = oy - ipy
+                ocz = oz - ipz
+                b_half = ocx * dx + ocy * dy + ocz * dz
+                c = ocx * ocx + ocy * ocy + ocz * ocz - br * br
+                disc = b_half * b_half - c
+                if disc < 0.0:
+                    continue
+                sqrt_disc = ti.sqrt(disc)
+                t0 = -b_half - sqrt_disc
+                t1 = -b_half + sqrt_disc
+                t_enter = t0 if t0 > 0.0 else t1
+                if t_enter < 1e-6 or t_enter >= best_t:
+                    continue
+
+                rm0 = pmt_rotmats[p, 0]
+                rm1 = pmt_rotmats[p, 1]
+                rm2 = pmt_rotmats[p, 2]
+                rm3 = pmt_rotmats[p, 3]
+                rm4 = pmt_rotmats[p, 4]
+                rm5 = pmt_rotmats[p, 5]
+                rm6 = pmt_rotmats[p, 6]
+                rm7 = pmt_rotmats[p, 7]
+                rm8 = pmt_rotmats[p, 8]
+
+                lox = ocx * rm0 + ocy * rm1 + ocz * rm2
+                loy = ocx * rm3 + ocy * rm4 + ocz * rm5
+                loz = ocx * rm6 + ocy * rm7 + ocz * rm8
+                ldx = dx * rm0 + dy * rm1 + dz * rm2
+                ldy = dx * rm3 + dy * rm4 + dz * rm5
+                ldz = dx * rm6 + dy * rm7 + dz * rm8
+
+                for t in range(hw_start, hw_end):
+                    v0x = pmt_hw_tris[t, 0]
+                    v0y = pmt_hw_tris[t, 1]
+                    v0z = pmt_hw_tris[t, 2]
+                    v1x = pmt_hw_tris[t, 3]
+                    v1y = pmt_hw_tris[t, 4]
+                    v1z = pmt_hw_tris[t, 5]
+                    v2x = pmt_hw_tris[t, 6]
+                    v2y = pmt_hw_tris[t, 7]
+                    v2z = pmt_hw_tris[t, 8]
+
+                    _hit, _t, _u, _v, _nx, _ny, _nz = _ray_triangle_intersect(
+                        lox, loy, loz, ldx, ldy, ldz,
+                        v0x, v0y, v0z,
+                        v1x, v1y, v1z,
+                        v2x, v2y, v2z,
+                    )
+
+                    if _hit and _t > 1e-6 and _t < best_t:
+                        hx_l = lox + ldx * _t
+                        hy_l = loy + ldy * _t
+                        hz_l = loz + ldz * _t
+
+                        wnx = _nx * rm0 + _ny * rm3 + _nz * rm6
+                        wny = _nx * rm1 + _ny * rm4 + _nz * rm7
+                        wnz = _nx * rm2 + _ny * rm5 + _nz * rm8
+                        n_len = ti.sqrt(wnx * wnx + wny * wny + wnz * wnz)
+                        if n_len > 1e-12:
+                            wnx /= n_len
+                            wny /= n_len
+                            wnz /= n_len
+
+                        best_t = _t
+                        best_x = ipx + hx_l * rm0 + hy_l * rm3 + hz_l * rm6
+                        best_y = ipy + hx_l * rm1 + hy_l * rm4 + hz_l * rm7
+                        best_z = ipz + hx_l * rm2 + hy_l * rm5 + hz_l * rm8
+                        best_nx = wnx
+                        best_ny = wny
+                        best_nz = wnz
+                        best_hit = CID_INNER_STRUCTURE
+                        best_det_idx = -1
+                        best_det_sys = DET_SYS_NONE
+                        best_mat = pmt_hw_mat_ids[t]
+
         for l in range(n_lappds):
             lcx = lappd_data[l, 0]
             lcy = lappd_data[l, 1]
@@ -1209,6 +1352,10 @@ def trace_rays(
         geometry.pmt_body_offsets,
         geometry.pmt_rotmats,
         geometry.pmt_mesh_types,
+        geometry.pmt_hw_types,
+        geometry.pmt_hw_tris,
+        geometry.pmt_hw_mat_ids,
+        geometry.pmt_hw_offsets,
         geometry.pmt_instance_pos,
         geometry.pmt_bounding_radii,
         geometry.lappd_data,

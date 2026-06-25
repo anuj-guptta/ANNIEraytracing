@@ -102,8 +102,22 @@ def load_pmt_body_meshes() -> dict[int, PMTMeshData]:
     return result
 
 
+def _load_hw_mesh_from_npy(mi: int, gn: str) -> np.ndarray | None:
+    """Load a decimated HW mesh from .npy cache, or None."""
+    npy_name = gn.replace(".gdml", "_decimated.npy")
+    p = MESH_DIR / npy_name
+    if p.exists():
+        arr = np.load(p)
+        print(f"  PMT HW mesh {mi} (decimated {npy_name}): {len(arr)//3} tris")
+        return arr
+    return None
+
+
 def load_pmt_hw_meshes() -> dict[int, PMTMeshData]:
     """Load hardware (holder) meshes for 8" and 10" PMTs.
+
+    Prefers decimated ``.npy`` cache files (created by decimate_hw.py).
+    Falls back to GDML parsing.
 
     Cached internally — second call is a no-op.
 
@@ -118,11 +132,17 @@ def load_pmt_hw_meshes() -> dict[int, PMTMeshData]:
 
     result: dict[int, PMTMeshData] = {}
     for mi, gn in PMT_HW_SPECS:
-        p = MESH_DIR / gn
-        if not p.exists():
-            print(f"  PMT HW mesh {mi} ({gn}): NOT FOUND")
-            continue
-        flat, n_tris = parse_gdml_flattened(p, recenter=False)
+        # Prefer decimated npy cache
+        flat = _load_hw_mesh_from_npy(mi, gn)
+        if flat is None:
+            p = MESH_DIR / gn
+            if not p.exists():
+                print(f"  PMT HW mesh {mi} ({gn}): NOT FOUND")
+                continue
+            flat, n_tris = parse_gdml_flattened(p, recenter=False)
+        else:
+            n_tris = len(flat) // 3
+
         mat_ids = classify_pmt_hardware(mi, n_tris)
         bradius = _compute_bounding_radius(flat)
         result[mi] = PMTMeshData(
@@ -259,3 +279,34 @@ def build_body_tris_arrays(
     body_mat_ids = np.concatenate(mat_list, axis=0) if mat_list else np.zeros(0, dtype=np.int32)
     body_offsets = np.array(offsets, dtype=np.int32)
     return body_tris, body_mat_ids, body_offsets
+
+
+def build_hw_tris_arrays(
+    hw_meshes: dict[int, PMTMeshData],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Concatenate all HW-mesh triangles and build offset table.
+
+    Returns
+    -------
+    hw_tris : (T_hw, 9) float32
+        Each row is 3 vertices in local frame.
+    hw_mat_ids : (T_hw,) int32
+        Material ID per triangle (TEFLON=4 or ACRYLIC=5).
+    hw_offsets : (3,) int32
+        Start index for mesh types 4, 5 plus sentinel.
+    """
+    tri_list: list[np.ndarray] = []
+    mat_list: list[np.ndarray] = []
+    offsets = [0]
+    for mt in (4, 5):
+        md = hw_meshes.get(mt)
+        if md is not None:
+            tri_list.append(md.vertices.reshape(-1, 9))
+            mat_list.append(md.material_ids)
+            offsets.append(offsets[-1] + md.n_tris)
+        else:
+            offsets.append(offsets[-1])
+    hw_tris = np.concatenate(tri_list, axis=0) if tri_list else np.zeros((0, 9), dtype=np.float32)
+    hw_mat_ids = np.concatenate(mat_list, axis=0) if mat_list else np.zeros(0, dtype=np.int32)
+    hw_offsets = np.array(offsets, dtype=np.int32)
+    return hw_tris, hw_mat_ids, hw_offsets
