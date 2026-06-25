@@ -13,8 +13,8 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import time
-import xml.etree.ElementTree as ET
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -22,162 +22,30 @@ from urllib.parse import urlparse, parse_qs
 import numpy as np
 
 from annieray.pmt_loader import rotate_z
+from annieray.pmt_mesh import build_viz_caches
 from annieray.tracer import build_geometry, trace_cherenkov, reload_lappd_corrections
 
 geometry = None
 
 pmt_instance_data: dict | None = None   # from pmt_loader
 
-# ---- PMT mesh caching ----
-MESH_DIR = Path("pmt_meshes")
-
-def _parse_gdml_flattened(path: Path, recenter=True):
-    """Parse GDML and return (binary float32 data, vertex_count)."""
-    tree = ET.parse(path)
-    root = tree.getroot()
-    positions = root.findall(".//position")
-    verts = {
-        p.attrib["name"]: (float(p.attrib["x"]), float(p.attrib["y"]), float(p.attrib["z"]))
-        for p in positions
-    }
-    triangles = root.findall(".//triangular")
-    out = []
-    for tri in triangles:
-        for key in ("vertex1", "vertex2", "vertex3"):
-            out.extend(verts[tri.attrib[key]])
-    arr = np.array(out, dtype=np.float32).reshape(-1, 3)
-    if recenter:
-        arr -= arr.mean(axis=0)
-    return arr.tobytes(), len(arr)
-
-def _build_color_buffer(flat_verts: np.ndarray, type_name: str, type_idx: int) -> bytes:
-    """Build per-vertex RGBA uint8 color buffer for a PMT mesh type.
-
-    Parameters
-    ----------
-    flat_verts:
-        ``(V, 3)`` float32 — flat vertex buffer (same layout as PMT_MESH_CACHE).
-    type_name:
-        PMT type name (e.g. ``"Hamamatsu"``) or ``"hw"`` for hardware.
-    type_idx:
-        Mesh type index (used for hardware classification).
-
-    Returns
-    -------
-        ``(V * 4,)`` bytes — RGBA uint8 per vertex.
-    """
-    from annieray.materials import classify_pmt_body, classify_pmt_hardware
-    from annieray.materials import MATERIAL_TABLE, MaterialID
-
-    n_tris = len(flat_verts) // 3
-
-    if type_name == "hw":
-        mat_ids = classify_pmt_hardware(type_idx, n_tris)
-    else:
-        tris = flat_verts.reshape(-1, 3, 3)
-        mat_ids = classify_pmt_body(tris, type_name)
-
-    colors = np.zeros((n_tris * 3, 4), dtype=np.uint8)
-    for tri_idx, mid in enumerate(mat_ids):
-        props = MATERIAL_TABLE.get(MaterialID(int(mid)))
-        r = int(props.color[0] * 255)
-        g = int(props.color[1] * 255)
-        b = int(props.color[2] * 255)
-        colors[tri_idx * 3] = [r, g, b, 255]
-        colors[tri_idx * 3 + 1] = [r, g, b, 255]
-        colors[tri_idx * 3 + 2] = [r, g, b, 255]
-
-    return colors.tobytes()
-
-def _build_pc_sub_mesh(flat_verts: np.ndarray, type_name: str, type_idx: int,
-                        offset_mm: float = 1.0) -> bytes:
-    """Build PC sub-mesh (PC triangles only) offset inward along face normals.
-
-    For frontend rendering: the PC inner layer is placed 1 mm inside the
-    glass surface so it appears as translucent coating behind the glass.
-    """
-    from annieray.materials import classify_pmt_body, classify_pmt_hardware
-    from annieray.materials import MaterialID
-
-    if type_name == "hw":
-        return b""
-
-    tris = flat_verts.reshape(-1, 3, 3)
-    mat_ids = classify_pmt_body(tris, type_name)
-    mask = mat_ids == int(MaterialID.PHOTOCATHODE)
-    tri_idx = np.where(mask)[0]
-    n = len(tri_idx)
-    if n == 0:
-        return b""
-
-    # Fetch all vertices for PC triangles
-    idx = np.repeat(tri_idx * 3, 3) + np.tile(np.arange(3), n)
-    verts = flat_verts[idx].copy()
-
-    # Face normals (outward)
-    v0 = flat_verts[tri_idx * 3]
-    v1 = flat_verts[tri_idx * 3 + 1]
-    v2 = flat_verts[tri_idx * 3 + 2]
-    normals = np.cross(v1 - v0, v2 - v0)
-    nlen = np.linalg.norm(normals, axis=1, keepdims=True)
-    nlen[nlen == 0] = 1
-    normals /= nlen
-
-    # Offset inward: subtract normal * offset
-    verts -= np.repeat(normals * offset_mm, 3, axis=0)
-    return verts.tobytes()
-
-
-def _build_pvc_sub_mesh(flat_verts: np.ndarray, type_name: str,
-                         type_idx: int) -> bytes:
-    """Build PVC sub-mesh for LUX/ETEL housing and wing triangles."""
-    from annieray.materials import classify_pmt_body
-    from annieray.materials import MaterialID
-
-    if type_name == "hw":
-        return b""
-    tris = flat_verts.reshape(-1, 3, 3)
-    mat_ids = classify_pmt_body(tris, type_name)
-    mask = mat_ids == int(MaterialID.PVC)
-    tri_idx = np.where(mask)[0]
-    n = len(tri_idx)
-    if n == 0:
-        return b""
-    idx = np.repeat(tri_idx * 3, 3) + np.tile(np.arange(3), n)
-    return flat_verts[idx].copy().tobytes()
-
-
-# Pre-parse single-instance PMT assembly meshes.
-# Keys align with PMT_MESH_TYPE in pmt_loader.py:
-#   0 = LUX (lux_bottom),  1 = ETEL (etel_top),
-#   2 = Hamamatsu (8" body),  3 = Watchboy/Watchman (10" body)
-# Each GDML file is a single tessellated PMT assembly (merged by extraction,
-# but there are no physvol — the "count" in metadata is the detector count).
+# ---- PMT mesh caching (built from shared pmt_mesh module) ----
+_viz_caches = build_viz_caches()
 PMT_MESH_CACHE: dict[int, bytes] = {}
 PMT_COLOR_CACHE: dict[int, bytes] = {}
-PMT_MESH_PC_CACHE: dict[int, bytes] = {}
-PMT_MESH_PVC_CACHE: dict[int, bytes] = {}
-# Type-name mapping for classification: 0-3 → body type, 4-5 → "hw"
-PMT_MESH_TYPE_NAMES = ["LUX", "ETEL", "Hamamatsu", "Watchboy", "hw", "hw"]
-for _mi, _gn, _rc in [(0, "pmt_lux_bottom.gdml", True),
-                       (1, "pmt_etel_top.gdml", True),
-                       (2, "pmt_8inch_body.gdml", False),
-                       (3, "pmt_10inch_body.gdml", False),
-                       (4, "pmt_8inch_hardware.gdml", False),
-                       (5, "pmt_10inch_hardware.gdml", False)]:
-    _p = MESH_DIR / _gn
-    if _p.exists():
-        _d, _nv = _parse_gdml_flattened(_p, recenter=_rc)
-        PMT_MESH_CACHE[_mi] = _d
-        _flat = np.frombuffer(_d, dtype=np.float32).reshape(-1, 3)
-        PMT_COLOR_CACHE[_mi] = _build_color_buffer(_flat, PMT_MESH_TYPE_NAMES[_mi], _mi)
-        PMT_MESH_PC_CACHE[_mi] = _build_pc_sub_mesh(_flat, PMT_MESH_TYPE_NAMES[_mi], _mi)
-        PMT_MESH_PVC_CACHE[_mi] = _build_pvc_sub_mesh(_flat, PMT_MESH_TYPE_NAMES[_mi], _mi)
-        print(f"  PMT mesh {_mi} ({_gn}): {_nv // 3} tris"
-              f" (PC sub: {len(PMT_MESH_PC_CACHE[_mi]) // 36} tris,"
-              f" PVC sub: {len(PMT_MESH_PVC_CACHE[_mi]) // 36} tris)")
-    else:
-        print(f"  PMT mesh {_mi} ({_gn}): NOT FOUND")
+PMT_MESH_PC_CACHE: dict[int, bytes] = _viz_caches[2]
+PMT_MESH_PVC_CACHE: dict[int, bytes] = _viz_caches[3]
+_body_verts, _body_colors, _body_pc, _body_pvc, _hw_verts, _hw_colors = _viz_caches
+PMT_MESH_CACHE.update(_body_verts)
+PMT_MESH_CACHE.update(_hw_verts)
+PMT_COLOR_CACHE.update(_body_colors)
+PMT_COLOR_CACHE.update(_hw_colors)
+# Print sub-mesh info matching previous style
+for _mi, _d in PMT_MESH_CACHE.items():
+    _n = len(_d) // 36
+    _pc_n = len(PMT_MESH_PC_CACHE.get(_mi, b"")) // 36
+    _pvc_n = len(PMT_MESH_PVC_CACHE.get(_mi, b"")) // 36
+    print(f"  PMT mesh {_mi}: {_n} tris (PC sub: {_pc_n}, PVC sub: {_pvc_n})")
 
 # ---- PMT tip positions cache ----
 PMT_TIPS_CACHE: list[dict] | None = None  # loaded from pmt_tip_positions.csv

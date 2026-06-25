@@ -18,6 +18,11 @@ PMT_BODY_SPECS: list[tuple[int, str, bool, str]] = [
     (3, "pmt_10inch_body.gdml",   False, "Watchboy"),
 ]
 
+PMT_HW_SPECS: list[tuple[int, str]] = [
+    (4, "pmt_8inch_hardware.gdml"),
+    (5, "pmt_10inch_hardware.gdml"),
+]
+
 
 @dataclass
 class PMTMeshData:
@@ -26,6 +31,11 @@ class PMTMeshData:
     material_ids: np.ndarray  # (T,) int32 — MaterialID per triangle
     bounding_radius: float    # mm — max ||vertex|| + 1 mm margin
     n_tris: int
+
+
+# Module-level caches so callers (tracer, viz server) share one parse
+_body_mesh_cache: dict[int, PMTMeshData] | None = None
+_hw_mesh_cache: dict[int, PMTMeshData] | None = None
 
 
 def parse_gdml_flattened(path: Path, recenter: bool = True
@@ -56,9 +66,15 @@ def _compute_bounding_radius(vertices: np.ndarray) -> float:
 def load_pmt_body_meshes() -> dict[int, PMTMeshData]:
     """Load all 4 PMT body meshes and classify per-triangle materials.
 
+    Cached internally — second call is a no-op.
+
     Returns dict mapping mesh type index 0-3 to PMTMeshData.
     Missing files are omitted (graceful fallback).
     """
+    global _body_mesh_cache
+    if _body_mesh_cache is not None:
+        return _body_mesh_cache
+
     from annieray.materials import classify_pmt_body
 
     result: dict[int, PMTMeshData] = {}
@@ -82,7 +98,135 @@ def load_pmt_body_meshes() -> dict[int, PMTMeshData]:
               f"PC={int((mat_ids == 2).sum())}, "
               f"GLASS={int((mat_ids == 1).sum())}, "
               f"PVC={int((mat_ids == 3).sum())}")
+    _body_mesh_cache = result
     return result
+
+
+def load_pmt_hw_meshes() -> dict[int, PMTMeshData]:
+    """Load hardware (holder) meshes for 8" and 10" PMTs.
+
+    Cached internally — second call is a no-op.
+
+    Returns dict mapping mesh type index 4-5 to PMTMeshData.
+    Missing files are omitted (graceful fallback).
+    """
+    global _hw_mesh_cache
+    if _hw_mesh_cache is not None:
+        return _hw_mesh_cache
+
+    from annieray.materials import classify_pmt_hardware
+
+    result: dict[int, PMTMeshData] = {}
+    for mi, gn in PMT_HW_SPECS:
+        p = MESH_DIR / gn
+        if not p.exists():
+            print(f"  PMT HW mesh {mi} ({gn}): NOT FOUND")
+            continue
+        flat, n_tris = parse_gdml_flattened(p, recenter=False)
+        mat_ids = classify_pmt_hardware(mi, n_tris)
+        bradius = _compute_bounding_radius(flat)
+        result[mi] = PMTMeshData(
+            vertices=flat,
+            material_ids=mat_ids,
+            bounding_radius=bradius,
+            n_tris=n_tris,
+        )
+        print(f"  PMT HW mesh {mi}: {n_tris} tris, "
+              f"bounding radius {bradius:.1f} mm, "
+              f"material={int(mat_ids[0])}")
+    _hw_mesh_cache = result
+    return result
+
+
+def build_viz_caches() -> tuple[dict[int, bytes], dict[int, bytes],
+                                dict[int, bytes], dict[int, bytes],
+                                dict[int, bytes], dict[int, bytes]]:
+    """Build byte-string caches needed by the viz server.
+
+    All meshes are loaded through the shared internal caches (no re-parsing).
+
+    Returns
+    -------
+    (body_verts, body_colors, body_pc, body_pvc, hw_verts, hw_colors)
+    Each is ``dict[int, bytes]`` keyed by mesh type index.
+    ``body_pc`` / ``body_pvc`` may contain ``b""`` for types with no
+    photocathode or PVC faces respectively.
+    """
+    from annieray.materials import MATERIAL_TABLE, MaterialID
+
+    body_meshes = load_pmt_body_meshes()
+    hw_meshes = load_pmt_hw_meshes()
+
+    body_verts: dict[int, bytes] = {}
+    body_colors: dict[int, bytes] = {}
+    body_pc: dict[int, bytes] = {}
+    body_pvc: dict[int, bytes] = {}
+
+    for mi, md in body_meshes.items():
+        body_verts[mi] = md.vertices.tobytes()
+
+        # Per-vertex RGBA from material table
+        n_tris = md.n_tris
+        colors = np.zeros((n_tris * 3, 4), dtype=np.uint8)
+        for tri_idx in range(n_tris):
+            mid = int(md.material_ids[tri_idx])
+            props = MATERIAL_TABLE.get(MaterialID(mid))
+            r = int(props.color[0] * 255)
+            g = int(props.color[1] * 255)
+            b = int(props.color[2] * 255)
+            colors[tri_idx * 3] =     [r, g, b, 255]
+            colors[tri_idx * 3 + 1] = [r, g, b, 255]
+            colors[tri_idx * 3 + 2] = [r, g, b, 255]
+        body_colors[mi] = colors.tobytes()
+
+        # PC sub-mesh (offset inward 1 mm along face normal)
+        pc_mask = md.material_ids == int(MaterialID.PHOTOCATHODE)
+        pc_tri_idx = np.where(pc_mask)[0]
+        if len(pc_tri_idx) > 0:
+            n = len(pc_tri_idx)
+            idx = np.repeat(pc_tri_idx * 3, 3) + np.tile(np.arange(3), n)
+            pc_verts = md.vertices[idx].copy()
+            v0 = md.vertices[pc_tri_idx * 3]
+            v1 = md.vertices[pc_tri_idx * 3 + 1]
+            v2 = md.vertices[pc_tri_idx * 3 + 2]
+            normals = np.cross(v1 - v0, v2 - v0)
+            nlen = np.linalg.norm(normals, axis=1, keepdims=True)
+            nlen[nlen == 0] = 1
+            normals /= nlen
+            pc_verts -= np.repeat(normals * 1.0, 3, axis=0)
+            body_pc[mi] = pc_verts.tobytes()
+        else:
+            body_pc[mi] = b""
+
+        # PVC sub-mesh
+        pvc_mask = md.material_ids == int(MaterialID.PVC)
+        pvc_tri_idx = np.where(pvc_mask)[0]
+        if len(pvc_tri_idx) > 0:
+            n = len(pvc_tri_idx)
+            idx = np.repeat(pvc_tri_idx * 3, 3) + np.tile(np.arange(3), n)
+            body_pvc[mi] = md.vertices[idx].copy().tobytes()
+        else:
+            body_pvc[mi] = b""
+
+    # Hardware caches (verts + colors, no PC/PVC sub-meshes)
+    hw_verts: dict[int, bytes] = {}
+    hw_colors: dict[int, bytes] = {}
+    for mi, md in hw_meshes.items():
+        hw_verts[mi] = md.vertices.tobytes()
+        n_tris = md.n_tris
+        colors = np.zeros((n_tris * 3, 4), dtype=np.uint8)
+        for tri_idx in range(n_tris):
+            mid = int(md.material_ids[tri_idx])
+            props = MATERIAL_TABLE.get(MaterialID(mid))
+            r = int(props.color[0] * 255)
+            g = int(props.color[1] * 255)
+            b = int(props.color[2] * 255)
+            colors[tri_idx * 3] =     [r, g, b, 255]
+            colors[tri_idx * 3 + 1] = [r, g, b, 255]
+            colors[tri_idx * 3 + 2] = [r, g, b, 255]
+        hw_colors[mi] = colors.tobytes()
+
+    return body_verts, body_colors, body_pc, body_pvc, hw_verts, hw_colors
 
 
 def build_body_tris_arrays(
