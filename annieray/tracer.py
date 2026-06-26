@@ -12,6 +12,7 @@ import taichi as ti
 from annieray import gdml_parser, step_parser
 from annieray import pmt_loader
 from annieray import pmt_mesh
+from annieray.optics import OpticalMaterial
 from annieray.step_parser import LAPPD_HALF_SIZE
 
 
@@ -46,6 +47,14 @@ HLV = 12 # local_v      (PMT: azimuthal angle φ in rad; LAPPD: position across 
 HMAT = 13 # material_id  (MaterialID enum value, e.g. GLASS=1, PHOTOCATHODE=2, ...)
 
 N_HIT_COLS = 14
+
+# Column indices in the expanded (post-kernel) hit array.
+# The kernel produces N_HIT_COLS columns (0..N_HIT_COLS-1).
+# trace_cherenkov appends the columns below.
+H_ARRIVAL = N_HIT_COLS      # 14 — arrival_time (ns)
+H_WAVELEN = N_HIT_COLS + 1  # 15 — wavelength (nm)
+H_BOUNCE  = N_HIT_COLS + 2  # 16 — number of surface reflections
+N_EXPANDED_COLS = N_HIT_COLS + 3  # 17
 
 # Speed of light in vacuum (mm/ns)
 C_MM_NS = 299.792458
@@ -1451,6 +1460,7 @@ def trace_kernel(
                 best_nz = nz
                 best_det_idx = -1
                 best_det_sys = DET_SYS_NONE
+                best_mat = 7  # BLACK_SHEET
 
         hits[i, HI] = 1.0 if best_hit != CID_NO_HIT else 0.0
         hits[i, HT] = best_t
@@ -1520,6 +1530,113 @@ def trace_rays(
     return hits
 
 
+def trace_with_optics(
+    origins: np.ndarray,
+    directions: np.ndarray,
+    geometry: Geometry,
+    optics_config: dict[int, OpticalMaterial],
+    max_bounces: int = 3,
+    n_water: float = N_WATER_DEFAULT,
+    rng: np.random.Generator | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Trace rays with multi-bounce optical surface physics.
+
+    Calls ``trace_rays()`` repeatedly, each time processing surface
+    interactions (Fresnel reflection/transmission, diffuse reflection,
+    absorption) per the per-material ``optics_config``.  Detected hits
+    carry the **total** optical path length in the ``HT`` column and
+    the number of surface reflections in the returned ``bounce_counts``.
+
+    Parameters
+    ----------
+    origins:
+        ``(N, 3)`` float32 — ray start points.
+    directions:
+        ``(N, 3)`` float32 — ray unit directions.
+    geometry:
+        Geometry bundle.
+    optics_config:
+        Per-material :class:`OpticalMaterial` dict from
+        :func:`load_optics_config`.
+    max_bounces:
+        Maximum number of surface reflections per photon (the first
+        trace counts as bounce 0).
+    n_water:
+        Refractive index of water (used for Fresnel computation).
+    rng:
+        NumPy random generator.
+
+    Returns
+    -------
+    (hits, bounce_counts):
+        ``hits`` is ``(M, N_HIT_COLS)`` float32 — detected hits only
+        (a subset of the input rays), with ``HT`` = total accumulated
+        path length.  ``bounce_counts`` is ``(M,)`` int32 — number of
+        surface reflections for each hit.  If no hits are detected,
+        returns two empty arrays.
+    """
+    from annieray.optics import evaluate_hit
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    origins = np.asarray(origins, dtype=np.float32).copy()
+    directions = np.asarray(directions, dtype=np.float32).copy()
+    n = len(origins)
+
+    total_path = np.zeros(n, dtype=np.float32)
+    alive = np.ones(n, dtype=bool)
+    n_bounces = np.zeros(n, dtype=np.int32)
+    detected_hits: list[np.ndarray] = []
+    detected_bounces: list[np.int32] = []
+
+    for bounce in range(max_bounces + 1):
+        idx = np.where(alive)[0]
+        if len(idx) == 0:
+            break
+
+        hits = trace_rays(origins[idx], directions[idx], geometry)
+
+        total_path[idx] += hits[:, HT]
+
+        next_alive = np.zeros(len(idx), dtype=bool)
+
+        for j in range(len(idx)):
+            i = idx[j]
+            if hits[j, HI] == 0:
+                alive[i] = False
+                continue
+
+            mat_id = int(hits[j, HMAT])
+            mat_opt = optics_config.get(mat_id)
+            if mat_opt is None:
+                alive[i] = False
+                continue
+
+            incident_dir = directions[i]
+            normal = hits[j, HNX:HNZ + 1]
+            action, new_dir = evaluate_hit(mat_opt, incident_dir, normal, n_water, rng)
+
+            if action == "detect":
+                hits[j, HT] = total_path[i]
+                detected_hits.append(hits[j:j + 1].copy())
+                detected_bounces.append(np.int32(bounce))
+                alive[i] = False
+            elif action == "reflect":
+                origins[i] = hits[j, HX:HZ + 1]
+                directions[i] = new_dir
+                next_alive[j] = True
+            # absorb: drop
+
+        alive[idx] = next_alive
+
+    if detected_hits:
+        hits_out = np.concatenate(detected_hits, axis=0)
+        bounces_out = np.array(detected_bounces, dtype=np.int32)
+        return hits_out, bounces_out
+    return np.zeros((0, N_HIT_COLS), dtype=np.float32), np.zeros(0, dtype=np.int32)
+
+
 def trace_cherenkov(
     muon_pos: tuple[float, float, float],
     muon_dir: tuple[float, float, float],
@@ -1528,26 +1645,25 @@ def trace_cherenkov(
     rng: np.random.Generator | None = None,
     wavelength_nm: float = 350.0,
     n_water: float = N_WATER_DEFAULT,
+    max_bounces: int = 0,
+    optics_config: dict[int, OpticalMaterial] | None = None,
 ) -> np.ndarray:
     """Trace Cherenkov photons from a muon track.
 
     Workflow:
       1. Call generate_cherenkov_photons() to get (origins, directions).
-      2. Run the GPU kernel via trace_rays() → (N, 14) hit array.
-      3. Expand to (N, 16) by appending arrival_time and wavelength.
+      2. Run the GPU kernel via trace_rays() or trace_with_optics().
+      3. Expand to (N, 17) by appending arrival_time, wavelength,
+         and bounce_count.
 
-    The expansion is the place to add per-photon wavelength and timing.
-    Currently wavelength_nm is a single scalar; for a per-photon spectrum,
-    generate_cherenkov_photons() should return a wavelength array and this
-    function should stamp it into full[:, 15] per-photon instead.
-
-    Returns (N, 16) hit array with columns:
+    Returns ``(N, N_EXPANDED_COLS)`` hit array with columns:
         0: hit_flag, 1: t (mm), 2-4: x,y,z, 5-7: nx,ny,nz,
         8: component_id, 9: detector_index, 10: detector_system,
         11: local_u, 12: local_v, 13: material_id,
-        14: arrival_time (ns), 15: wavelength (nm)
+        14: arrival_time (ns), 15: wavelength (nm), 16: bounce_count
     """
     from annieray.cherenkov import generate_cherenkov_photons
+    from annieray.optics import load_optics_config
 
     if rng is None:
         rng = np.random.default_rng()
@@ -1555,33 +1671,29 @@ def trace_cherenkov(
     origins, directions = generate_cherenkov_photons(
         muon_pos, muon_dir, n_photons, rng=rng,
     )
-    hits = trace_rays(origins, directions, geometry)
 
-    # ---- Expand from 13 to 15 columns ----
-    # Kernel output: columns 0-12 (hit_flag through local_v).
-    # We add columns 13 (arrival_time in ns) and 14 (wavelength in nm).
+    if max_bounces > 0:
+        cfg = optics_config if optics_config is not None else load_optics_config(None)
+        hits, bounce_counts = trace_with_optics(
+            origins, directions, geometry, cfg,
+            max_bounces=max_bounces, n_water=n_water, rng=rng,
+        )
+    else:
+        hits = trace_rays(origins, directions, geometry)
+        bounce_counts = np.zeros(hits.shape[0], dtype=np.int32)
+
+    # ---- Expand from N_HIT_COLS to N_EXPANDED_COLS ----
+    # Add arrival_time (14), wavelength (15), bounce_count (16).
     n = hits.shape[0]
-    full = np.zeros((n, N_HIT_COLS + 2), dtype=np.float32)
+    full = np.zeros((n, N_EXPANDED_COLS), dtype=np.float32)
     full[:, :N_HIT_COLS] = hits
 
-    # Col 14: wavelength
-    # Currently a single value for all photons.  To support per-photon
-    # wavelength sampling, replace this line with per-photon assignment
-    # using a wavelength array from generate_cherenkov_photons().
-    full[:, N_HIT_COLS + 1] = wavelength_nm
+    full[:, H_WAVELEN] = wavelength_nm
+    full[:, H_BOUNCE] = bounce_counts
 
-    # Col 13: arrival_time = photon path length / speed_of_light_in_water
-    #   t = ray path length from origin to hit (mm)
-    #   C = 299.79 mm/ns (vacuum)
-    #   n = refractive index of water
-    #   arrival_time = t / (C / n)
-    #
-    # NOTE: This assumes all photons start at the same vertex.  Once muon
-    # propagation is added, the per-photon emission time along the track
-    # must be added to this calculation.
     c_in_water = C_MM_NS / n_water
     hit_mask = hits[:, HI] > 0.5
     if hit_mask.any():
-        full[hit_mask, N_HIT_COLS] = hits[hit_mask, HT] / c_in_water
+        full[hit_mask, H_ARRIVAL] = hits[hit_mask, HT] / c_in_water
 
     return full
