@@ -96,6 +96,30 @@ class Geometry:
     # ---- Per-triangle material IDs for structure mesh ----
     mesh_material_ids: np.ndarray | None = None  # (M,) int32 — MaterialID per tri
 
+    # ---- BVH acceleration for structure mesh ----
+    bvh_node_min: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
+    bvh_node_max: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=np.float32)
+    )
+    bvh_node_left: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int32)
+    )
+    bvh_node_right: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int32)
+    )
+    bvh_tri_start: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int32)
+    )
+    bvh_tri_end: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int32)
+    )
+    bvh_tri_ids: np.ndarray = field(
+        default_factory=lambda: np.empty(0, dtype=np.int32)
+    )
+    bvh_n_nodes: int = 0
+
     # ---- PMT body meshes (triangle soup per instance type, local frame) ----
     pmt_body_tris: np.ndarray = field(
         default_factory=lambda: np.zeros((0, 9), dtype=np.float32)
@@ -193,6 +217,10 @@ def build_geometry(
     verts, tris = gdml_parser.parse_gdml(gdml_path)
     if det_rotation_deg != 0.0 and verts.shape[0] > 0:
         pmt_loader.rotate_z(verts, det_rotation_deg)
+
+    # ---- Stage 1b: build BVH for structure mesh ----
+    from annieray.bvh import build_bvh
+    bvh = build_bvh(verts, tris)
 
     # ---- Stage 2: load PMT positions ----
     # PMTs can come from: (a) Scan CSV file, (b) STEP manifest JSON, (c) STEP raw.
@@ -437,10 +465,69 @@ def build_geometry(
         pmt_hw_types=pmt_hw_types_arr,
         pmt_instance_pos=pmt_instance_pos_arr,
         pmt_bounding_radii=pmt_bounding_radii_arr,
+        # BVH
+        bvh_node_min=bvh.node_min,
+        bvh_node_max=bvh.node_max,
+        bvh_node_left=bvh.node_left,
+        bvh_node_right=bvh.node_right,
+        bvh_tri_start=bvh.tri_start,
+        bvh_tri_end=bvh.tri_end,
+        bvh_tri_ids=bvh.tri_ids,
+        bvh_n_nodes=bvh.n_nodes,
     )
 
 
 # ---- Taichi helper functions (single-return pattern for Taichi compat) ----
+
+
+@ti.func
+def _ray_bbox_intersect(ox, oy, oz, dx, dy, dz,
+                        lo_x, lo_y, lo_z,
+                        hi_x, hi_y, hi_z):
+    """Slab-method ray–AABB intersection.  Returns (hit, t_near)."""
+    hit = 0
+    t_near = 0.0
+    tmin = -1e30
+    tmax = 1e30
+    ok = 1
+
+    if ti.abs(dx) > 1e-12:
+        inv_d = 1.0 / dx
+        t1 = (lo_x - ox) * inv_d
+        t2 = (hi_x - ox) * inv_d
+        tmin = ti.max(tmin, ti.min(t1, t2))
+        tmax = ti.min(tmax, ti.max(t1, t2))
+    else:
+        if ox < lo_x or ox > hi_x:
+            ok = 0
+
+    if ok:
+        if ti.abs(dy) > 1e-12:
+            inv_d = 1.0 / dy
+            t1 = (lo_y - oy) * inv_d
+            t2 = (hi_y - oy) * inv_d
+            tmin = ti.max(tmin, ti.min(t1, t2))
+            tmax = ti.min(tmax, ti.max(t1, t2))
+        else:
+            if oy < lo_y or oy > hi_y:
+                ok = 0
+
+    if ok:
+        if ti.abs(dz) > 1e-12:
+            inv_d = 1.0 / dz
+            t1 = (lo_z - oz) * inv_d
+            t2 = (hi_z - oz) * inv_d
+            tmin = ti.max(tmin, ti.min(t1, t2))
+            tmax = ti.min(tmax, ti.max(t1, t2))
+        else:
+            if oz < lo_z or oz > hi_z:
+                ok = 0
+
+    if ok and tmin <= tmax and tmax > 1e-6:
+        hit = 1
+        t_near = ti.max(tmin, 0.0)
+
+    return hit, t_near
 
 
 @ti.func
@@ -845,6 +932,14 @@ def trace_kernel(
     mesh_vertices: ti.types.ndarray(ndim=2),
     mesh_triangles: ti.types.ndarray(ndim=2),
     mesh_material_ids: ti.types.ndarray(ndim=1),
+    bvh_node_min: ti.types.ndarray(ndim=2),
+    bvh_node_max: ti.types.ndarray(ndim=2),
+    bvh_node_left: ti.types.ndarray(ndim=1),
+    bvh_node_right: ti.types.ndarray(ndim=1),
+    bvh_tri_start: ti.types.ndarray(ndim=1),
+    bvh_tri_end: ti.types.ndarray(ndim=1),
+    bvh_tri_ids: ti.types.ndarray(ndim=1),
+    bvh_n_nodes: ti.i32,
     pmt_centers: ti.types.ndarray(ndim=2),
     pmt_radii: ti.types.ndarray(ndim=1),
     pmt_dirs: ti.types.ndarray(ndim=2),
@@ -903,40 +998,87 @@ def trace_kernel(
         best_lv = 0.0
         best_mat = 0  # MaterialID
 
-        for t in range(n_tris):
-            i0 = mesh_triangles[t, 0]
-            i1 = mesh_triangles[t, 1]
-            i2 = mesh_triangles[t, 2]
+        # ---- BVH-accelerated structure mesh (replaces brute-force loop) ----
+        if bvh_n_nodes > 0:
+            stack = ti.Vector([-1]*32, dt=ti.i32)
+            stack[0] = bvh_n_nodes - 1  # root
+            sp = 0
 
-            v0x = mesh_vertices[i0, 0]
-            v0y = mesh_vertices[i0, 1]
-            v0z = mesh_vertices[i0, 2]
-            v1x = mesh_vertices[i1, 0]
-            v1y = mesh_vertices[i1, 1]
-            v1z = mesh_vertices[i1, 2]
-            v2x = mesh_vertices[i2, 0]
-            v2y = mesh_vertices[i2, 1]
-            v2z = mesh_vertices[i2, 2]
+            while sp >= 0:
+                node = stack[sp]
+                sp -= 1
 
-            hit, t_hit, u, v, nx, ny, nz = _ray_triangle_intersect(
-                ox, oy, oz, dx, dy, dz,
-                v0x, v0y, v0z,
-                v1x, v1y, v1z,
-                v2x, v2y, v2z,
-            )
+                if node < 0:
+                    continue
 
-            if hit and t_hit > 1e-6 and t_hit < best_t:
-                best_t = t_hit
-                best_hit = CID_INNER_STRUCTURE
-                best_x = ox + dx * t_hit
-                best_y = oy + dy * t_hit
-                best_z = oz + dz * t_hit
-                best_nx = nx
-                best_ny = ny
-                best_nz = nz
-                best_det_idx = -1
-                best_det_sys = DET_SYS_NONE
-                best_mat = mesh_material_ids[t] if mesh_material_ids.shape[0] > 0 else 0
+                if bvh_node_left[node] == -1:  # leaf
+                    for idx in range(bvh_tri_start[node], bvh_tri_end[node]):
+                        t = bvh_tri_ids[idx]
+                        i0 = mesh_triangles[t, 0]
+                        i1 = mesh_triangles[t, 1]
+                        i2 = mesh_triangles[t, 2]
+
+                        v0x = mesh_vertices[i0, 0]
+                        v0y = mesh_vertices[i0, 1]
+                        v0z = mesh_vertices[i0, 2]
+                        v1x = mesh_vertices[i1, 0]
+                        v1y = mesh_vertices[i1, 1]
+                        v1z = mesh_vertices[i1, 2]
+                        v2x = mesh_vertices[i2, 0]
+                        v2y = mesh_vertices[i2, 1]
+                        v2z = mesh_vertices[i2, 2]
+
+                        h, th, _u, _v, nx, ny, nz = _ray_triangle_intersect(
+                            ox, oy, oz, dx, dy, dz,
+                            v0x, v0y, v0z,
+                            v1x, v1y, v1z,
+                            v2x, v2y, v2z,
+                        )
+
+                        if h and th > 1e-6 and th < best_t:
+                            best_t = th
+                            best_hit = CID_INNER_STRUCTURE
+                            best_x = ox + dx * th
+                            best_y = oy + dy * th
+                            best_z = oz + dz * th
+                            best_nx = nx
+                            best_ny = ny
+                            best_nz = nz
+                            best_det_idx = -1
+                            best_det_sys = DET_SYS_NONE
+                            best_mat = mesh_material_ids[t] if mesh_material_ids.shape[0] > 0 else 0
+                else:  # internal node — test children, push near-first
+                    ln = bvh_node_left[node]
+                    hl, tl = _ray_bbox_intersect(ox, oy, oz, dx, dy, dz,
+                        bvh_node_min[ln, 0], bvh_node_min[ln, 1], bvh_node_min[ln, 2],
+                        bvh_node_max[ln, 0], bvh_node_max[ln, 1], bvh_node_max[ln, 2])
+
+                    rn = bvh_node_right[node]
+                    hr, tr = _ray_bbox_intersect(ox, oy, oz, dx, dy, dz,
+                        bvh_node_min[rn, 0], bvh_node_min[rn, 1], bvh_node_min[rn, 2],
+                        bvh_node_max[rn, 0], bvh_node_max[rn, 1], bvh_node_max[rn, 2])
+
+                    if hl and hr:
+                        if tl < tr:
+                            if tr < best_t:
+                                sp += 1
+                                stack[sp] = rn
+                            if tl < best_t:
+                                sp += 1
+                                stack[sp] = ln
+                        else:
+                            if tl < best_t:
+                                sp += 1
+                                stack[sp] = ln
+                            if tr < best_t:
+                                sp += 1
+                                stack[sp] = rn
+                    elif hl and tl < best_t:
+                        sp += 1
+                        stack[sp] = ln
+                    elif hr and tr < best_t:
+                        sp += 1
+                        stack[sp] = rn
 
         for p in range(n_pmts):
             # If this PMT has loaded mesh data, skip the analytic sphere entirely.
@@ -1344,6 +1486,14 @@ def trace_rays(
         geometry.mesh_triangles.astype(np.int32),
         geometry.mesh_material_ids if geometry.mesh_material_ids is not None
         else np.zeros(0, dtype=np.int32),
+        geometry.bvh_node_min,
+        geometry.bvh_node_max,
+        geometry.bvh_node_left,
+        geometry.bvh_node_right,
+        geometry.bvh_tri_start,
+        geometry.bvh_tri_end,
+        geometry.bvh_tri_ids,
+        geometry.bvh_n_nodes,
         geometry.pmt_centers,
         geometry.pmt_radii,
         geometry.pmt_directions,
