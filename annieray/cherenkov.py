@@ -3,10 +3,7 @@
 #This file is only for testing the basic Cherenkov algorithm and generating data to compare against 
 
 import numpy as np
-import random as rng
 import math
-
-
 
 print("CherenkovAlgoTest.py is Running \n __________________________ ")
 
@@ -20,6 +17,7 @@ def truncate(number, decimals = 0):
     return math.trunc(number*factor)/factor
 
 #Takes in angles to make coefficients for x,y,z components
+#Expects a multi row array for alpha
 def getComp(thetaC,alpha):
     lam = np.sin(thetaC)*np.cos(alpha)
     kap = np.sin(thetaC)*np.sin(alpha)
@@ -67,11 +65,13 @@ def getBasis(vector):
 
 #Takes in the vector to generate two orthogonal vectors along with two angles
 #Calls the previous two functions to generate the global photon vector
-def getPhotonVec(vector,thetaC,alpha):
-    b1,b2 = getBasis(vector)
+#Expects a multi row array for alpha
+def getPhotonVec(vector,b1,b2,thetaC,alpha):
     lam, kap,eta = getComp(thetaC,alpha)
-    normVector = vector/np.linalg.norm(vector)
-    vector = lam*b1 + kap*b2 + eta*normVector #Photon vector in global cords
+    normVector = np.asarray(vector) / np.linalg.norm(vector)
+    vector = (lam[:, np.newaxis] * b1
+              + kap[:, np.newaxis] * b2
+              + eta * normVector)
 
     return vector
 
@@ -80,7 +80,6 @@ def getPhotonVec(vector,thetaC,alpha):
 beta = 0.999999 # Speed of the muon as a fraction of the speed of light
 n =1.34 #Refractive index of medium
 trackPrec = 2 #control the step size of the track (currently cm steps along track)
-photonNum = 150 #Default number of photons generated per cm along track 
 LengthTravel = 4
 defaultWavelength = 1234 #Just here because the original file has a singular specified wavelength
 def generate_cherenkov_photons(
@@ -88,81 +87,41 @@ def generate_cherenkov_photons(
     muonDirec,
     photons_per_cm: int = 150,
     thetaC: float = 0.73,
-    rng: np.random.Generator | None=None, #Only here because the original has it here
-    wavelength: float = defaultWavelength #Only here because the original has it here
-    ) -> tuple[np.ndarray,np.ndarray]:
-    #If no start time is given make it a 
+    rng: np.random.Generator | None=None,
+    wavelength: float = defaultWavelength
+    ) -> tuple[np.ndarray,np.ndarray,np.ndarray]:
+    if rng is None:
+        rng = np.random.default_rng()
+
     if len(muon_pos) != 4:
         muonStart = tuple([muon_pos[0],muon_pos[1],muon_pos[2],0])
     else:
         muonStart = muon_pos
 
-    i = int(LengthTravel*10**trackPrec) #convert m to the desired precision for use as number of iterations in for loop
-    photonDat = [] #initializing list to hold photon id, segment generation id, global start position, and global direction vectors
-    netK = [-1] #Initializing list to hold total k iterations
-    createTime = [] #Initializing a list that will track run time and photon creation time
-    muonSpeed = beta*c #Speed of muon in m/s
-    #Calculting time delay and recording the generation time of each photon
-    timeDelay = ((10**(-trackPrec)) / (beta*c))/(10**-9) # Time delay between photon generation in ns
-    
-    muonPath = tuple(x*LengthTravel for x in muonDirec) #specified muon path
+    n_steps = int(LengthTravel*10**trackPrec) + 1
+    muonSpeed = beta*c
 
-    for j in range(i+1): #+1 to include the end point of the track as well as the zeroth point where the first photon is generated (actually a nice case of 0 indexing working in favor)        
-        photonSegmentID = j+1 #This is the ID for the segment of the track where the photon is generated
+    b1,b2 = getBasis(muonDirec)
 
-        #Cords of muon in the global frame 
-        posX = (muonDirec[0])*j*(10**-trackPrec) +muonStart[0]#X cord in m
-        posY = (muonDirec[1])*j*(10**-trackPrec)+muonStart[1] #Y cord in m
-        posZ = (muonDirec[2])*j*(10**-trackPrec)+muonStart[2] #Z cord in m
-        
-        timeMuon = j*timeDelay+muonStart[3]*(10**-9) #This is the muon time (s)
-        #print('Photon Generation Event:',j, '\n') #Nice to have some way of measuring progress is happening
-        
-        #Generate photonNum photons per unit length along the track and perform any necessary calculations
-        for k in range(photons_per_cm): 
+    muonArray = rng.uniform(0, LengthTravel, size=n_steps * photons_per_cm)
+    muonArray.sort()
 
-            #Run spatial probability of photon generation
-            photonProb = rng.uniform(0,1)
-            photonPos = j*(10**-trackPrec)+photonProb*(10**-trackPrec) #Position of photon along track in m
-            
-            #Calculate photon creation time in ns from some given start time | Remember the start time is defined in seconds
-            createTime.append(((photonPos)/(muonSpeed)+muonStart[3])*(10**9))
+    createTime = (muonArray / muonSpeed) * 10**9 + muonStart[3] * 10**9
 
-            #Generate photon ID
-            photonID = netK[-1]+2 #Should be the only line required to assign the id
+    photonAlpha = rng.uniform(0, 2 * np.pi, size=n_steps * photons_per_cm)
 
-            #Wavelength placeholder
-            photWave = 234 #placeholder
+    photStartPosArray = muonArray[:, np.newaxis] * np.array(muonDirec)
+    photonDirec = getPhotonVec(muonDirec, b1, b2, thetaC, photonAlpha)
 
-            #Finding photon position in global
-            #photonX = photonPos * muonDirec[0] + muonStart[0] #Getting global X photon cord (m)
-            #photonY = photonPos * muonDirec[1] + muonStart[1] #Getting global Y photon cord (m)
-            #photonZ = photonPos * muonDirec[2] + muonStart[2] #Getting global Z photon cord (m)
-            
-            photonX = photonPos * muonDirec[0] * 1000 + muonStart[0]  # mm
-            photonY = photonPos * muonDirec[1] * 1000 + muonStart[1]  # mm
-            photonZ = photonPos * muonDirec[2] * 1000 + muonStart[2]  # mm
+    origins = np.empty((n_steps * photons_per_cm, 3), dtype=np.float32)
+    directions = np.empty((n_steps * photons_per_cm, 3), dtype=np.float32)
 
-            #Finding directional unit vector of photon compared in global frame
-            photonAlpha = rng.uniform(0, 2 * np.pi) #Random azimuthal angle for photon emission
-            xDirec, yDirec, zDirec = getPhotonVec(muonDirec,thetaC,photonAlpha)
+    origins[:,0] = 1000 * photStartPosArray[:,0] + muonStart[0]
+    origins[:,1] = 1000 * photStartPosArray[:,1] + muonStart[1]
+    origins[:,2] = 1000 * photStartPosArray[:,2] + muonStart[2]
 
-            #This is the total photon id, +1 has been added to k to avoid multiple zeros in the photon id
-            netK.append(k + j * photons_per_cm) 
+    directions[:,0] = photonDirec[:,0]
+    directions[:,1] = photonDirec[:,1]
+    directions[:,2] = photonDirec[:,2]
 
-            photonDat.append((photonSegmentID, photonID, createTime[-1], xDirec, yDirec, zDirec, photonX, photonY, photonZ, photWave)) # Append photon id, time, direction, and position
-    #Initialize lists and assign data
-    origins = np.empty((photons_per_cm * (i + 1), 3), dtype=np.float32) 
-    directions = np.empty((photons_per_cm * (i + 1), 3), dtype=np.float32) 
-    
-    origins[:,0] = [row[6] for row in photonDat]
-    origins[:,1] = [row[7] for row in photonDat]
-    origins[:,2] = [row[8] for row in photonDat]
-
-    directions[:,0] = [row[3] for row in photonDat]
-    directions[:,1] = [row[4] for row in photonDat]
-    directions[:,2] = [row[5] for row in photonDat]
-
-    create_times = np.array(createTime[:len(origins)], dtype=np.float32)
-    return origins, directions, create_times
-#print('Cherenkov.py is finished')
+    return origins, directions, createTime.astype(np.float32)
