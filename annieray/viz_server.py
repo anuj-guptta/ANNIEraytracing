@@ -420,8 +420,8 @@ class VizHandler(BaseHTTPRequestHandler):
             dx = float(params.get("dx", ["0"])[0])
             dy = float(params.get("dy", ["0"])[0])
             dz = float(params.get("dz", ["-1"])[0])
-            n = int(params.get("n", ["10000"])[0])
-            n = min(max(n, 100), 1_000_000)
+            photons_per_cm = int(params.get("photons_per_cm", ["150"])[0])
+            photons_per_cm = min(max(photons_per_cm, 1), 1000)
         except (ValueError, TypeError):
             self._send_json({"error": "invalid parameters"}, 400)
             return
@@ -430,11 +430,12 @@ class VizHandler(BaseHTTPRequestHandler):
         t0 = time.time()
         reload_lappd_corrections(geometry)
         hits = trace_cherenkov(
-            (mx, my, mz), (dx, dy, dz), n, geometry, rng=rng,
+            (mx, my, mz), (dx, dy, dz), photons_per_cm, geometry, rng=rng,
         )
         elapsed = time.time() - t0
 
         total_hits = int(hits[:, 0].sum())
+        total_photons = photons_per_cm * 401
 
         # Return positions by component type — these are drawn as dots
         comp = hits[:, 8]
@@ -455,7 +456,7 @@ class VizHandler(BaseHTTPRequestHandler):
                 "tank": len(tank_positions),
             },
             "total_hits": total_hits,
-            "total_photons": n,
+            "total_photons": total_photons,
             "time_ms": round(elapsed * 1000, 1),
         })
 
@@ -897,7 +898,7 @@ async function doTrace() {
     const dx = Math.sin(theta) * Math.cos(phi);
     const dy = Math.sin(theta) * Math.sin(phi);
     const dz = Math.cos(theta);
-    const n = 10000;
+    const photonsPerCm = 150;
 
     const btn = document.getElementById('traceBtn');
     btn.disabled = true;
@@ -905,7 +906,7 @@ async function doTrace() {
     traceResultEl = document.getElementById('traceResult');
 
     try {
-        const url = `/api/trace?mx=${mx}&my=${my}&mz=${mz}&dx=${dx.toFixed(6)}&dy=${dy.toFixed(6)}&dz=${dz.toFixed(6)}&n=${n}`;
+        const url = `/api/trace?mx=${mx}&my=${my}&mz=${mz}&dx=${dx.toFixed(6)}&dy=${dy.toFixed(6)}&dz=${dz.toFixed(6)}&photons_per_cm=${photonsPerCm}`;
         const resp = await fetch(url);
         const data = await resp.json();
 
@@ -983,6 +984,7 @@ async function doTrace() {
             + `struct <b>${c.struct}</b>, `
             + `LAPPD <b>${c.lappd}</b>, `
             + `tank <b>${c.tank}</b>) `
+            + `<span style="color:#888">· ${photonsPerCm} ph/cm</span> `
             + `in ${data.time_ms} ms`;
     } catch (e) {
         traceResultEl.textContent = 'Trace failed: ' + e.message;

@@ -88,7 +88,8 @@ def generate_cherenkov_photons(
     photons_per_cm: int = 150,
     thetaC: float = 0.73,
     rng: np.random.Generator | None=None,
-    wavelength: float = defaultWavelength
+    wavelength: float = defaultWavelength,
+    track_length: float = 4.0,
     ) -> tuple[np.ndarray,np.ndarray,np.ndarray]:
     if rng is None:
         rng = np.random.default_rng()
@@ -98,12 +99,12 @@ def generate_cherenkov_photons(
     else:
         muonStart = muon_pos
 
-    n_steps = int(LengthTravel*10**trackPrec) + 1
+    n_steps = int(track_length * 10**trackPrec) + 1
     muonSpeed = beta*c
 
     b1,b2 = getBasis(muonDirec)
 
-    muonArray = rng.uniform(0, LengthTravel, size=n_steps * photons_per_cm)
+    muonArray = rng.uniform(0, track_length, size=n_steps * photons_per_cm)
     muonArray.sort()
 
     createTime = (muonArray / muonSpeed) * 10**9 + muonStart[3] * 10**9

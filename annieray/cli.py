@@ -31,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--step", type=Path, default=None, help="Path to STEP CAD file")
     run.add_argument("--manifest", type=Path, default=None, help="Path to cached component manifest JSON")
     run.add_argument("--pmt-csv", type=Path, default=None, help="Path to PMT scan file or CSV (default: PMTPositions_Scan.txt near GDML)")
-    run.add_argument("--photons", type=int, default=100000, help="Number of photons to trace")
+    run.add_argument("--photons-per-cm", type=int, default=150, help="Photons per cm along the 4 m muon track (total ≈ 401 × this value)")
     run.add_argument("--output", "-o", type=Path, default=Path("hits.parquet"), help="Output Parquet path")
     run.add_argument("--seed", type=int, default=None, help="Random seed")
     run.add_argument("--mode", choices=["uniform", "cherenkov"], default="uniform",
@@ -151,7 +151,7 @@ def _generate_uniform(geometry: Geometry, n: int, rng: np.random.Generator) -> t
 #Call generate_cherenkov for each muon, make a seperate function for multiple muon generation
 def _generate_cherenkov(
     geometry: Geometry,
-    n: int,
+    photons_per_cm: int,
     rng: np.random.Generator,
     muon_pos: tuple = (0.0, 0.0, 2000.0), #Tank coordinate system (cartesian based on the cylinder) where z is height
     muon_dir: tuple = (0.0, 0.0, -1.0),
@@ -168,7 +168,7 @@ def _generate_cherenkov(
     from annieray.cherenkov import generate_cherenkov_photons
 
     origins, directions, create_times = generate_cherenkov_photons(
-        muon_pos, muon_dir, n,
+        muon_pos, muon_dir, photons_per_cm,
         cherenkov_angle=cherenkov_angle, rng=rng,
     )
     return origins, directions
@@ -213,16 +213,17 @@ def run_command(args: argparse.Namespace) -> None:
     if args.max_bounces > 0 and args.mode == "cherenkov":
         print(f"\nMulti-bounce optics enabled: max {args.max_bounces} reflections per photon")
 
-    print(f"\nGenerating {args.photons} photons ({args.mode} mode)...")
+    total_photons = args.photons_per_cm * 401
+    print(f"\nGenerating {args.photons_per_cm} photons/cm × 401 steps = {total_photons} total ({args.mode} mode)...")
     t0 = time.time()
     if args.mode == "uniform":
-        origins, directions = _generate_uniform(geom, args.photons, rng)
+        origins, directions = _generate_uniform(geom, total_photons, rng)
         hits = trace_rays(origins, directions, geom)
     else:
         optics_cfg = load_optics_config(args.optics_config) if args.max_bounces > 0 else None
         hits = trace_cherenkov(
             (0.0, 0.0, 2000.0), (0.0, 0.0, -1.0),
-            args.photons, geom, rng=rng,
+            args.photons_per_cm, geom, rng=rng,
             wavelength_nm=args.wavelength,
             max_bounces=args.max_bounces,
             optics_config=optics_cfg,
@@ -231,7 +232,7 @@ def run_command(args: argparse.Namespace) -> None:
     print(f"  Generated/traced in {t_gen:.2f}s")
 
     n_hit = int(hits[:, 0].sum())
-    print(f"\nResults: {n_hit}/{args.photons} hit ({n_hit / args.photons * 100:.1f}%)")
+    print(f"\nResults: {n_hit}/{total_photons} hit ({n_hit / total_photons * 100:.1f}%)")
 
     from annieray.tracer import CID_PMT, CID_LAPPD, CID_INNER_STRUCTURE, CID_TANK_WALL
     cid_names = {CID_INNER_STRUCTURE: "structure", CID_PMT: "PMT", CID_LAPPD: "LAPPD", CID_TANK_WALL: "tank"}

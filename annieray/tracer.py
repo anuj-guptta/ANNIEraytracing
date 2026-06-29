@@ -1,6 +1,7 @@
 """GPU-accelerated analytic ray tracer using Taichi."""
 
 import csv
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1653,11 +1654,82 @@ def trace_with_optics(
             np.zeros(0, dtype=np.int32))
 
 
+def _housing_from_array(arr: np.ndarray):
+    """Convert a (16,) housing array back into a LAPPDHousing dataclass."""
+    from annieray.lappd_model import LAPPDHousing
+    cx, cy, cz = arr[0], arr[1], arr[2]
+    ax = (arr[3], arr[4], arr[5])
+    ay = (arr[6], arr[7], arr[8])
+    az = (arr[9], arr[10], arr[11])
+    hx, hy, hz = arr[12], arr[13], arr[14]
+    return LAPPDHousing(
+        centre=(cx, cy, cz),
+        axes=(ax, ay, az),
+        half=(float(hx), float(hy), float(hz)),
+    )
+
+
+def compute_tank_track_length(
+    muon_pos: tuple[float, float, float],
+    muon_dir: tuple[float, float, float],
+    tank_radius: float,
+    tank_z_min: float,
+    tank_z_max: float,
+) -> float:
+    """Maximum muon track length (m) before exiting the tank cylinder.
+
+    Returns 1.05 × the ray-to-exit distance in metres, or 4.0 m fallback.
+    """
+    Px, Py, Pz = muon_pos[0], muon_pos[1], muon_pos[2]
+    Dx, Dy, Dz = muon_dir[0], muon_dir[1], muon_dir[2]
+    R = tank_radius
+    z_min = tank_z_min
+    z_max = tank_z_max
+
+    candidates = []
+
+    # ---- Cylinder wall (radial exit) ----
+    a = Dx * Dx + Dy * Dy
+    if a > 1e-12:
+        b = 2.0 * (Px * Dx + Py * Dy)
+        c = Px * Px + Py * Py - R * R
+        disc = b * b - 4.0 * a * c
+        if disc >= 0.0:
+            sqrt_disc = math.sqrt(disc)
+            t1 = (-b + sqrt_disc) / (2.0 * a)
+            if t1 > 0:
+                z_at_wall = Pz + t1 * Dz
+                if z_min <= z_at_wall <= z_max:
+                    candidates.append(t1)
+
+    # ---- Top cap (Z = z_max) ----
+    if Dz > 0:
+        t = (z_max - Pz) / Dz
+        if t > 0:
+            r2 = (Px + t * Dx) ** 2 + (Py + t * Dy) ** 2
+            if r2 <= R * R:
+                candidates.append(t)
+
+    # ---- Bottom cap (Z = z_min) ----
+    if Dz < 0:
+        t = (z_min - Pz) / Dz
+        if t > 0:
+            r2 = (Px + t * Dx) ** 2 + (Py + t * Dy) ** 2
+            if r2 <= R * R:
+                candidates.append(t)
+
+    if not candidates:
+        return 4.0
+
+    track_mm = min(candidates)
+    return max(track_mm * 1.05 / 1000.0, 0.5)
+
+
 def trace_cherenkov(
     muon_pos: tuple[float, float, float],
     muon_dir: tuple[float, float, float],
-    n_photons: int,
-    geometry: Geometry,
+    photons_per_cm: int = 150,
+    geometry: Geometry | None = None,
     rng: np.random.Generator | None = None,
     wavelength_nm: float = 350.0,
     n_water: float = N_WATER_DEFAULT,
@@ -1667,10 +1739,21 @@ def trace_cherenkov(
     """Trace Cherenkov photons from a muon track.
 
     Workflow:
-      1. Call generate_cherenkov_photons() to get (origins, directions).
-      2. Run the GPU kernel via trace_rays() or trace_with_optics().
-      3. Expand to (N, 17) by appending arrival_time, wavelength,
+      1. Compute track length from geometry (tank cylinder or LAPPD housing).
+      2. Call generate_cherenkov_photons() with that track length.
+      3. Run the GPU kernel via trace_rays() or trace_with_optics().
+      4. Expand to (N, 17) by appending arrival_time, wavelength,
          and bounce_count.
+
+    Parameters
+    ----------
+    photons_per_cm : int
+        Photons generated per cm along the muon track.
+        Total photons ≈ ``track_length_cm × photons_per_cm``.
+    geometry : Geometry | None
+        If provided, the track length is automatically computed
+        from the tank or LAPPD housing bounds.  When ``None``,
+        a fixed 4.0 m track is used.
 
     Returns ``(N, N_EXPANDED_COLS)`` hit array with columns:
         0: hit_flag, 1: t (mm), 2-4: x,y,z, 5-7: nx,ny,nz,
@@ -1679,14 +1762,42 @@ def trace_cherenkov(
         14: arrival_time (ns), 15: wavelength (nm), 16: bounce_count
     """
     from annieray.cherenkov import generate_cherenkov_photons
+    from annieray.lappd_model import compute_housing_track_length
     from annieray.optics import load_optics_config
 
     if rng is None:
         rng = np.random.default_rng()
 
+    # ---- Compute track length from geometry ----
+    pos3 = muon_pos[:3] if len(muon_pos) > 3 else muon_pos
+    dir3 = muon_dir[:3] if len(muon_dir) > 3 else muon_dir
+    if geometry is not None and geometry.lappd_housing_data.shape[0] > 0:
+        hd = geometry.lappd_housing_data[0]
+        housing = _housing_from_array(hd)
+        track_length = compute_housing_track_length(pos3, dir3, housing)
+    elif geometry is not None:
+        track_length = compute_tank_track_length(
+            pos3, dir3,
+            geometry.tank_radius, geometry.tank_z_min, geometry.tank_z_max,
+        )
+    else:
+        track_length = 4.0
+
     origins, directions, create_times = generate_cherenkov_photons(
-        muon_pos, muon_dir, n_photons, rng=rng,
+        muon_pos, muon_dir, photons_per_cm, track_length=track_length, rng=rng,
     )
+
+    # ---- No geometry → just return the generated rays (no intersection testing) ----
+    if geometry is None:
+        n = origins.shape[0]
+        full = np.zeros((n, N_EXPANDED_COLS), dtype=np.float32)
+        full[:, HI] = 1.0
+        full[:, HX:HZ + 1] = origins
+        full[:, HDI] = -1.0
+        full[:, HDS] = float(DET_SYS_NONE)
+        full[:, H_WAVELEN] = wavelength_nm
+        full[:, H_ARRIVAL] = create_times
+        return full
 
     if max_bounces > 0:
         cfg = optics_config if optics_config is not None else load_optics_config(None)
