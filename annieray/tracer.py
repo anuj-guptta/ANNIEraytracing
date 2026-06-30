@@ -169,6 +169,11 @@ class Geometry:
         default_factory=lambda: np.zeros(0, dtype=np.float32)
     )  # (P,) float32 — max(body, HW) bounding sphere radius
 
+    # ---- Surfboard (obscurant PVC panel) oriented boxes ----
+    surfboard_data: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 16), dtype=np.float32)
+    )  # (S, 16) float32 — same layout as lappd_housing_data
+
     # ---- LAPPD correction state ----
     lappd_corrections_baked: np.ndarray | None = None  # (1,3) float32 — last-applied dx,dy,dz
 
@@ -200,6 +205,89 @@ def reload_lappd_corrections(geo: Geometry):
         geo.annie_lappd_data[0, 0:3] += delta[0]
 
 
+def build_surfboards(n: int, tank_z_min: float, tank_z_max: float) -> np.ndarray:
+    """Build oriented-box data for N surfboard obscurant panels.
+
+    Surfboards are long rectangular PVC panels (2450×280×10 mm) mounted
+    vertically on the octagonal columns at the forward-most vertices of
+    the tank.  They absorb photons and stop muon tracks.
+
+    Parameters
+    ----------
+    n : int
+        Number of surfboards (0, 1, or 3).
+    tank_z_min, tank_z_max : float
+        Tank Z bounds (mm) — used to centre the surfboard vertically.
+
+    Returns
+    -------
+    np.ndarray
+        ``(n, 16)`` float32 — oriented-box layout matching
+        ``lappd_housing_data``.
+
+    Layout of the 16 columns::
+
+        [cx, cy, cz, ax_x,ax_y,ax_z, ay_x,ay_y,ay_z, az_x,az_y,az_z, hx,hy,hz, pad]
+
+    The local frame convention (same as the housing)::
+
+        local_X : tangential to the tank (width direction, 280 mm total)
+        local_Y : vertical, along +Z (length direction, 2450 mm total)
+        local_Z : radially inward (thickness direction, 10 mm total)
+    """
+    if n not in (0, 1, 3):
+        raise ValueError(f"n_surfboards must be 0, 1, or 3, got {n}")
+    if n == 0:
+        return np.empty((0, 16), dtype=np.float32)
+
+    column_r = 1304.0
+    z_centre = (tank_z_min + tank_z_max) / 2.0
+    half_x = 140.0   # 280 mm / 2
+    half_y = 1225.0  # 2450 mm / 2
+    half_z = 5.0     # 10 mm / 2
+
+    if n == 1:
+        angles_deg = [90.0]
+    else:
+        angles_deg = [45.0, 90.0, 135.0]
+
+    rows = []
+    for a_deg in angles_deg:
+        a = math.radians(a_deg)
+        cx = column_r * math.cos(a)
+        cy = column_r * math.sin(a)
+        cz = z_centre
+
+        cos_a = math.cos(a)
+        sin_a = math.sin(a)
+
+        # local_Z = radially inward
+        az_x = -cos_a
+        az_y = -sin_a
+        az_z = 0.0
+
+        # local_Y = vertical
+        ay_x = 0.0
+        ay_y = 0.0
+        ay_z = 1.0
+
+        # local_X = tangential = cross(local_Y, local_Z)
+        ax_x = sin_a
+        ax_y = -cos_a
+        ax_z = 0.0
+
+        rows.append([
+            cx, cy, cz,
+            ax_x, ax_y, ax_z,
+            ay_x, ay_y, ay_z,
+            az_x, az_y, az_z,
+            half_x, half_y, half_z,
+            0.0,  # pad
+        ])
+
+    return np.array(rows, dtype=np.float32)
+
+
 def build_geometry(
     gdml_path: Path,
     step_path: Optional[Path] = None,
@@ -212,6 +300,7 @@ def build_geometry(
     bottom_rotation_deg: float = 45.0,
     bottom_spin_deg: float = 0.0,
     det_rotation_deg: float = 22.5,
+    n_surfboards: int = 0,
 ) -> Geometry:
     """Build a Geometry from a GDML file and optional PMT/STEP data sources.
 
@@ -458,6 +547,9 @@ def build_geometry(
     n_tris = tris.shape[0]
     mesh_material_ids = np.full(n_tris, 4, dtype=np.int32) if n_tris > 0 else np.zeros(0, dtype=np.int32)
 
+    # ---- Surfboard obscurant panels (optional) ----
+    surfboard_data = build_surfboards(n_surfboards, tank_z_min, tank_z_max)
+
     return Geometry(
         mesh_vertices=verts,
         mesh_triangles=tris,
@@ -472,6 +564,7 @@ def build_geometry(
         tank_z_max=tank_z_max,
         lappd_housing_data=lappd_housing_data,
         annie_lappd_data=annie_lappd_data,
+        surfboard_data=surfboard_data,
         detectors=detectors,
         pmt_body_tris=pmt_body_tris,
         pmt_body_mat_ids=pmt_body_mat_ids,
@@ -980,6 +1073,7 @@ def trace_kernel(
     tank_z_max: ti.f32,
     housing_data: ti.types.ndarray(ndim=2),
     annie_lappd_data: ti.types.ndarray(ndim=2),
+    surfboard_data: ti.types.ndarray(ndim=2),
     hits: ti.types.ndarray(ndim=2),
 ):
     n_rays = origins.shape[0]
@@ -987,6 +1081,7 @@ def trace_kernel(
     n_pmts = pmt_centers.shape[0]
     n_lappds = lappd_data.shape[0]
     n_housings = housing_data.shape[0]
+    n_surfboards = surfboard_data.shape[0]
     n_body_tris = pmt_body_tris.shape[0]
     n_hw_tris = pmt_hw_tris.shape[0]
 
@@ -1453,6 +1548,45 @@ def trace_kernel(
                 best_lv = vv
                 best_mat = 2  # PHOTOCATHODE (ANNIE LAPPD)
 
+        # ---- Surfboard obscurant panels (absorbing) ----
+        for s in range(n_surfboards):
+            scx = surfboard_data[s, 0]
+            scy = surfboard_data[s, 1]
+            scz = surfboard_data[s, 2]
+            ax_x = surfboard_data[s, 3]
+            ax_y = surfboard_data[s, 4]
+            ax_z = surfboard_data[s, 5]
+            ay_x = surfboard_data[s, 6]
+            ay_y = surfboard_data[s, 7]
+            ay_z = surfboard_data[s, 8]
+            az_x = surfboard_data[s, 9]
+            az_y = surfboard_data[s, 10]
+            az_z = surfboard_data[s, 11]
+            shx = surfboard_data[s, 12]
+            shy = surfboard_data[s, 13]
+            shz = surfboard_data[s, 14]
+
+            sb_hit, t_sb, _ = _ray_box_intersect(
+                ox, oy, oz, dx, dy, dz,
+                scx, scy, scz,
+                ax_x, ax_y, ax_z,
+                ay_x, ay_y, ay_z,
+                az_x, az_y, az_z,
+                shx, shy, shz,
+            )
+
+            if sb_hit and t_sb > 1e-6 and t_sb < best_t:
+                best_t = t_sb
+                best_hit = CID_NO_HIT
+                best_x = ox + dx * t_sb
+                best_y = oy + dy * t_sb
+                best_z = oz + dz * t_sb
+                best_nx = 0.0
+                best_ny = 0.0
+                best_nz = 0.0
+                best_det_idx = -1
+                best_det_sys = DET_SYS_NONE
+
         hit, t_hit, nx, ny, nz = _ray_tank_intersect(
             ox, oy, oz, dx, dy, dz,
             tank_radius,
@@ -1535,6 +1669,7 @@ def trace_rays(
         geometry.tank_z_max,
         geometry.lappd_housing_data,
         geometry.annie_lappd_data,
+        geometry.surfboard_data,
         hits,
     )
     return hits
@@ -1734,20 +1869,65 @@ def compute_track_length(
 
     Delegates to ``compute_tank_track_length`` or
     ``compute_housing_track_length`` based on the geometry contents.
-    Falls back to 4.0 m when no geometry is available.
+    Also tests against surfboard boxes and returns the shortest
+    distance.  Falls back to 4.0 m when no geometry is available.
     """
     pos3 = muon_pos[:3] if len(muon_pos) > 3 else muon_pos
     dir3 = muon_dir[:3] if len(muon_dir) > 3 else muon_dir
+
+    best = 1e30
+
     if geometry is not None and geometry.lappd_housing_data.shape[0] > 0:
         hd = geometry.lappd_housing_data[0]
         housing = _housing_from_array(hd)
-        return compute_housing_track_length(pos3, dir3, housing)
-    elif geometry is not None:
-        return compute_tank_track_length(
+        best = min(best, compute_housing_track_length(pos3, dir3, housing))
+
+    if geometry is not None:
+        for s in range(geometry.surfboard_data.shape[0]):
+            row = geometry.surfboard_data[s]
+            cx, cy, cz = row[0], row[1], row[2]
+            ax = (row[3], row[4], row[5])
+            ay = (row[6], row[7], row[8])
+            az = (row[9], row[10], row[11])
+            hx, hy, hz = row[12], row[13], row[14]
+
+            ox, oy, oz = pos3
+            dx, dy, dz = dir3
+            t_min = -1e30
+            t_max = 1e30
+            for aax, aay, aaz, h in [(ax[0], ax[1], ax[2], hx),
+                                       (ay[0], ay[1], ay[2], hy),
+                                       (az[0], az[1], az[2], hz)]:
+                denom = dx * aax + dy * aay + dz * aaz
+                oc = (ox - cx) * aax + (oy - cy) * aay + (oz - cz) * aaz
+                if abs(denom) > 1e-30:
+                    t0 = (-h - oc) / denom
+                    t1 = (h - oc) / denom
+                else:
+                    t0 = -1e30 if (-h - oc) < 0 else 1e30
+                    t1 = 1e30 if (h - oc) > 0 else -1e30
+                if t0 > t1:
+                    t0, t1 = t1, t0
+                if t0 > t_min:
+                    t_min = t0
+                if t1 < t_max:
+                    t_max = t1
+                if t_min > t_max:
+                    break
+            else:
+                if t_max > 0 and t_min > -1e-6:
+                    track_mm = max(t_max, 0.0)
+                    best = min(best, track_mm * 1.05 / 1000.0)
+
+    if geometry is not None and best > 1e29:
+        best = compute_tank_track_length(
             pos3, dir3,
             geometry.tank_radius, geometry.tank_z_min, geometry.tank_z_max,
         )
-    return 4.0
+
+    if best > 1e29:
+        return 4.0
+    return max(best, 0.5)
 
 
 def trace_cherenkov(

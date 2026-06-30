@@ -121,6 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--full-wf", action="store_true",
                        help="Use full waveform path for PMT response")
     batch.add_argument("--no-lappd", action="store_true", help="Skip LAPPD rectangles")
+    batch.add_argument("--surfboard", type=int, default=0, choices=[0, 1, 3],
+                       help="Number of obscurant PVC surfboards (0, 1, or 3)")
     batch.add_argument("--z-offset", type=float, default=0.0, help="Vertical offset (mm)")
     batch.add_argument("--lappd-model", choices=["default", "annie"], default="annie",
                        help="LAPPD geometry model")
@@ -231,7 +233,7 @@ def run_command(args: argparse.Namespace) -> None:
     geom = build_geometry(args.gdml, step_path=args.step, manifest_path=args.manifest,
                           pmt_csv_path=args.pmt_csv, lappd_indices=lappd_indices,
                           no_lappd=args.no_lappd, z_offset=args.z_offset, lappd_model=args.lappd_model,
-                          det_rotation_deg=args.det_rotation)
+                          det_rotation_deg=args.det_rotation, n_surfboards=args.surfboard)
 
     print(f"  Mesh: {geom.mesh_vertices.shape[0]} vertices, {geom.mesh_triangles.shape[0]} triangles")
     print(f"  PMTs: {geom.pmt_centers.shape[0]} (radii: {set(f'{r:.1f}' for r in geom.pmt_radii)})")
@@ -364,12 +366,14 @@ def batch_command(args: argparse.Namespace) -> None:
                           pmt_csv_path=args.pmt_csv, lappd_indices=lappd_indices,
                           no_lappd=args.no_lappd, z_offset=args.z_offset,
                           lappd_model=args.lappd_model,
-                          det_rotation_deg=args.det_rotation)
+                          det_rotation_deg=args.det_rotation, n_surfboards=args.surfboard)
 
     print(f"  Mesh: {geom.mesh_vertices.shape[0]} verts, {geom.mesh_triangles.shape[0]} tris")
     print(f"  PMTs: {geom.pmt_centers.shape[0]}")
     print(f"  LAPPDs: {geom.lappd_data.shape[0]}")
     print(f"  Tank: R={geom.tank_radius:.0f} mm, Z=[{geom.tank_z_min:.0f}, {geom.tank_z_max:.0f}]")
+    if geom.surfboard_data.shape[0] > 0:
+        print(f"  Surfboards: {geom.surfboard_data.shape[0]} PVC panels")
 
     if args.muon_file:
         print(f"  Muon topology: from file ({args.muon_file})")

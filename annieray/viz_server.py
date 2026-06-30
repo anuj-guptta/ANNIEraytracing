@@ -113,6 +113,8 @@ class VizHandler(BaseHTTPRequestHandler):
             self._handle_trace(params)
         elif path == "/api/housing":
             self._send_lappd_housing()
+        elif path == "/api/surfboards":
+            self._send_surfboards()
         elif path == "/api/lappd_correction":
             self._send_lappd_correction()
         elif path == "/api/detectors":
@@ -242,6 +244,22 @@ class VizHandler(BaseHTTPRequestHandler):
                 "pc_half": [ad[6]],
             },
         })
+
+    def _send_surfboards(self):
+        if geometry.surfboard_data.shape[0] == 0:
+            self._send_json({"surfboards": []})
+            return
+        boards = []
+        for i in range(geometry.surfboard_data.shape[0]):
+            row = geometry.surfboard_data[i].tolist()
+            boards.append({
+                "center": [row[0], row[1], row[2]],
+                "axis_x": [row[3], row[4], row[5]],
+                "axis_y": [row[6], row[7], row[8]],
+                "axis_z": [row[9], row[10], row[11]],
+                "half": [row[12], row[13], row[14]],
+            })
+        self._send_json({"surfboards": boards})
 
     def _send_lappd_correction(self):
         if not self._lappd_corr_path or not os.path.exists(self._lappd_corr_path):
@@ -1484,6 +1502,36 @@ async function init() {
             });
 
             document.getElementById('focusLAPPD').disabled = false;
+        }
+
+        // ---- Surfboard obscurant panels ----
+        const surfResp = await fetch('/api/surfboards');
+        const surfData = await surfResp.json();
+        if (Array.isArray(surfData.surfboards)) {
+            const surfMat = new THREE.MeshStandardMaterial({
+                color: 0x333344,
+                roughness: 0.8,
+                metalness: 0.0,
+                side: THREE.DoubleSide,
+                transparent: true,
+                opacity: 0.35,
+            });
+            for (const sb of surfData.surfboards) {
+                const geo = new THREE.BoxGeometry(sb.half[0]*2, sb.half[1]*2, sb.half[2]*2);
+                const mesh = new THREE.Mesh(geo, surfMat);
+                mesh.position.set(sb.center[0], sb.center[1], sb.center[2]);
+                const m4 = new THREE.Matrix4();
+                m4.set(
+                    sb.axis_x[0], sb.axis_y[0], sb.axis_z[0], 0,
+                    sb.axis_x[1], sb.axis_y[1], sb.axis_z[1], 0,
+                    sb.axis_x[2], sb.axis_y[2], sb.axis_z[2], 0,
+                    0, 0, 0, 1,
+                );
+                mesh.quaternion.setFromRotationMatrix(m4);
+                mesh.castShadow = true;
+                mesh.receiveShadow = true;
+                scene.add(mesh);
+            }
         }
 
         // ---- Grey toggles for structure and PMTs ----
