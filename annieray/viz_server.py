@@ -2372,7 +2372,7 @@ def run_server(args):
 
     import taichi as ti
 
-    ti.init(default_fp=ti.f32)
+    ti.init(arch=ti.cpu, default_fp=ti.f32)
 
     pmt_csv = args.pmt_csv
     if pmt_csv is None:

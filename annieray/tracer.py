@@ -2011,6 +2011,8 @@ def compute_track_length(
     pos3 = muon_pos[:3] if len(muon_pos) > 3 else muon_pos
     dir3 = muon_dir[:3] if len(muon_dir) > 3 else muon_dir
 
+    from annieray.lappd_model import compute_housing_track_length
+
     best = 1e30
 
     if geometry is not None and geometry.lappd_housing_data.shape[0] > 0:
