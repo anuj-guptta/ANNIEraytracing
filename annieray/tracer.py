@@ -1725,6 +1725,31 @@ def compute_tank_track_length(
     return max(track_mm * 1.05 / 1000.0, 0.5)
 
 
+def compute_track_length(
+    muon_pos: tuple[float, float, float],
+    muon_dir: tuple[float, float, float],
+    geometry: Geometry | None,
+) -> float:
+    """Geometry-aware muon track length in metres.
+
+    Delegates to ``compute_tank_track_length`` or
+    ``compute_housing_track_length`` based on the geometry contents.
+    Falls back to 4.0 m when no geometry is available.
+    """
+    pos3 = muon_pos[:3] if len(muon_pos) > 3 else muon_pos
+    dir3 = muon_dir[:3] if len(muon_dir) > 3 else muon_dir
+    if geometry is not None and geometry.lappd_housing_data.shape[0] > 0:
+        hd = geometry.lappd_housing_data[0]
+        housing = _housing_from_array(hd)
+        return compute_housing_track_length(pos3, dir3, housing)
+    elif geometry is not None:
+        return compute_tank_track_length(
+            pos3, dir3,
+            geometry.tank_radius, geometry.tank_z_min, geometry.tank_z_max,
+        )
+    return 4.0
+
+
 def trace_cherenkov(
     muon_pos: tuple[float, float, float],
     muon_dir: tuple[float, float, float],
@@ -1769,19 +1794,7 @@ def trace_cherenkov(
         rng = np.random.default_rng()
 
     # ---- Compute track length from geometry ----
-    pos3 = muon_pos[:3] if len(muon_pos) > 3 else muon_pos
-    dir3 = muon_dir[:3] if len(muon_dir) > 3 else muon_dir
-    if geometry is not None and geometry.lappd_housing_data.shape[0] > 0:
-        hd = geometry.lappd_housing_data[0]
-        housing = _housing_from_array(hd)
-        track_length = compute_housing_track_length(pos3, dir3, housing)
-    elif geometry is not None:
-        track_length = compute_tank_track_length(
-            pos3, dir3,
-            geometry.tank_radius, geometry.tank_z_min, geometry.tank_z_max,
-        )
-    else:
-        track_length = 4.0
+    track_length = compute_track_length(muon_pos, muon_dir, geometry)
 
     origins, directions, create_times = generate_cherenkov_photons(
         muon_pos, muon_dir, photons_per_cm, track_length=track_length, rng=rng,

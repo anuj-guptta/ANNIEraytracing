@@ -19,8 +19,11 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from annieray.tracer import (
-    HI, HDI, HDS, HLU, HLV, H_ARRIVAL, H_WAVELEN,
-    DET_SYS_PMT, DET_SYS_LAPPD_ANNIE, trace_cherenkov, Geometry,
+    HI, HT, HDI, HDS, HLU, HLV, H_ARRIVAL, H_WAVELEN, H_BOUNCE,
+    DET_SYS_PMT, DET_SYS_LAPPD_ANNIE, DET_SYS_NONE,
+    N_HIT_COLS, N_EXPANDED_COLS,
+    C_MM_NS, N_WATER_DEFAULT,
+    trace_rays, trace_cherenkov, compute_track_length, Geometry,
 )
 
 
@@ -272,6 +275,7 @@ class BatchConfig:
     photons_per_cm: int = 150
     wavelength_nm: float = 350.0
     max_bounces: int = 0
+    batch_size: int = 50
 
     # Response models
     pmt_response: bool = False
@@ -311,49 +315,108 @@ def run_batch(
         ``{"photon_hits": ..., "pmt_responses": ...}`` — only keys that
         were actually written.
     """
+    from annieray.cherenkov import generate_cherenkov_photons
+    from annieray.pmt_response import process_pmt_hits
+
     rng = np.random.default_rng(config.seed)
     accumulator = BatchAccumulator()
 
-    # Pre-load muon file if specified
     if config.muon_file is not None:
         _load_muon_file(config.muon_file)
 
-    # Pre-build PMT config lookup only once
-    from annieray.pmt_response import process_pmt_hits
+    batch_size = max(1, config.batch_size)
+    n_water = N_WATER_DEFAULT
+    c_in_water = C_MM_NS / n_water
+    wave_nm = float(config.wavelength_nm)
 
     t_start = time.time()
+    processed = 0
 
-    for event_id in range(config.n_events):
-        muon_pos, muon_dir = sample_muon_state(
-            event_id, config, rng, geometry,
-        )
+    while processed < config.n_events:
+        batch_end = min(processed + batch_size, config.n_events)
+        n_batch = batch_end - processed
 
-        hits = trace_cherenkov(
-            muon_pos, muon_dir,
-            photons_per_cm=config.photons_per_cm,
-            geometry=geometry,
-            rng=rng,
-            wavelength_nm=config.wavelength_nm,
-            max_bounces=config.max_bounces,
-            optics_config=optics_config,
-        )
+        # --- Collect photons for all events in this batch ---
+        batch_origins: list[np.ndarray] = []
+        batch_dirs: list[np.ndarray] = []
+        batch_ctimes: list[np.ndarray] = []
+        event_counts: list[int] = []
+        event_muon: list[tuple] = []
 
-        pmt_responses = None
-        if config.pmt_response:
-            pmt_responses = process_pmt_hits(
-                hits, geometry, rng=rng, full_wf=config.pmt_full_wf,
+        for i in range(n_batch):
+            event_id = processed + i
+            muon_pos, muon_dir = sample_muon_state(event_id, config, rng, geometry)
+            track_length = compute_track_length(muon_pos, muon_dir, geometry)
+            o, d, ct = generate_cherenkov_photons(
+                muon_pos, muon_dir, config.photons_per_cm,
+                track_length=track_length, rng=rng,
+            )
+            batch_origins.append(o)
+            batch_dirs.append(d)
+            batch_ctimes.append(ct)
+            event_counts.append(len(o))
+            event_muon.append((muon_pos, muon_dir))
+
+        # Concatenate into one big array
+        all_origins = np.vstack(batch_origins)
+        all_dirs = np.vstack(batch_dirs)
+        all_ctimes = np.concatenate(batch_ctimes)
+
+        # --- One GPU launch for the whole batch ---
+        if config.max_bounces > 0:
+            from annieray.tracer import trace_with_optics
+            from annieray.optics import load_optics_config
+            cfg = optics_config if optics_config is not None else load_optics_config(None)
+            hits, bounce_counts, orig_indices = trace_with_optics(
+                all_origins, all_dirs, geometry, cfg,
+                max_bounces=config.max_bounces, n_water=n_water, rng=rng,
+            )
+        else:
+            hits = trace_rays(all_origins, all_dirs, geometry)
+            bounce_counts = np.zeros(hits.shape[0], dtype=np.int32)
+            orig_indices = np.arange(hits.shape[0], dtype=np.int32)
+
+        # --- Expand to N_EXPANDED_COLS across all photons ---
+        n_total = hits.shape[0]
+        full = np.zeros((n_total, N_EXPANDED_COLS), dtype=np.float32)
+        full[:, :N_HIT_COLS] = hits
+        full[:, H_WAVELEN] = wave_nm
+        full[:, H_BOUNCE] = bounce_counts
+
+        hit_mask = hits[:, HI] > 0.5
+        if hit_mask.any():
+            full[hit_mask, H_ARRIVAL] = (
+                all_ctimes[orig_indices[hit_mask]]
+                + hits[hit_mask, HT] / c_in_water
             )
 
-        if config.record_events:
-            accumulator.append_event(event_id, hits, pmt_responses)
+        # --- Slice back per event ---
+        offsets = np.empty(n_batch + 1, dtype=np.int64)
+        offsets[0] = 0
+        np.cumsum(event_counts, out=offsets[1:])
 
-        if (event_id + 1) % max(1, config.n_events // 10) == 0:
-            elapsed = time.time() - t_start
-            rate = (event_id + 1) / elapsed if elapsed > 0 else 0
-            print(
-                f"  [{event_id + 1}/{config.n_events}] "
-                f"{elapsed:.1f}s elapsed, {rate:.1f} ev/s"
-            )
+        for i in range(n_batch):
+            event_id = processed + i
+            sl = slice(offsets[i], offsets[i + 1])
+            event_hits = full[sl]
+
+            pmt_responses = None
+            if config.pmt_response:
+                pmt_responses = process_pmt_hits(
+                    event_hits, geometry, rng=rng, full_wf=config.pmt_full_wf,
+                )
+
+            if config.record_events:
+                accumulator.append_event(event_id, event_hits, pmt_responses)
+
+        processed += n_batch
+
+        elapsed = time.time() - t_start
+        rate = processed / elapsed if elapsed > 0 else 0
+        print(
+            f"  [{processed}/{config.n_events}] "
+            f"{elapsed:.1f}s elapsed, {rate:.1f} ev/s"
+        )
 
     elapsed = time.time() - t_start
     print(f"  Total: {elapsed:.1f}s for {config.n_events} events "

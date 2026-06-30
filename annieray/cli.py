@@ -110,6 +110,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="File with one topology per line: 'x y z t0 dx dy dz'")
     batch.add_argument("--photons-per-cm", type=int, default=150,
                        help="Photons per cm along the muon track")
+    batch.add_argument("--batch-size", type=int, default=50,
+                       help="Events per GPU launch (default: 50, higher = faster)")
     batch.add_argument("--output-dir", "-o", type=Path, default=Path("results"),
                        help="Output directory for Parquet files")
     batch.add_argument("--no-record", action="store_true",
@@ -335,6 +337,7 @@ def batch_command(args: argparse.Namespace) -> None:
         photons_per_cm=args.photons_per_cm,
         wavelength_nm=args.wavelength,
         max_bounces=args.max_bounces,
+        batch_size=args.batch_size,
         pmt_response=args.pmt_response,
         pmt_full_wf=args.full_wf,
         output_dir=args.output_dir,
