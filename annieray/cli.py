@@ -76,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Per-PMT spin (deg) about forward axis for bottom PMTs (default: 22.5)")
     viz.add_argument("--det-rotation", type=float, default=22.5,
                      help="Global Z-rotation (deg) so +Y aligns with octagon corner (default: 22.5)")
+    viz.add_argument("--surfboard", type=int, default=0, choices=[0, 1, 3],
+                     help="Number of obscurant PVC surfboards (0, 1, or 3)")
 
     detcfg = sub.add_parser("build-detector-config",
                             help="Build detector registry YAML from geometry")

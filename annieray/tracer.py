@@ -246,6 +246,10 @@ def build_surfboards(n: int, tank_z_min: float, tank_z_max: float) -> np.ndarray
     half_y = 1225.0  # 2450 mm / 2
     half_z = 5.0     # 10 mm / 2
 
+    # User-requested offsets applied to all surfboards
+    dz_vert = -114.0  # vertical (local_Y / +Z); net = +390 - 504
+    dr_rad = 65.0     # +radial inward (local_Z toward tank centre); net = +50 + 15
+
     if n == 1:
         angles_deg = [90.0]
     else:
@@ -254,10 +258,6 @@ def build_surfboards(n: int, tank_z_min: float, tank_z_max: float) -> np.ndarray
     rows = []
     for a_deg in angles_deg:
         a = math.radians(a_deg)
-        cx = column_r * math.cos(a)
-        cy = column_r * math.sin(a)
-        cz = z_centre
-
         cos_a = math.cos(a)
         sin_a = math.sin(a)
 
@@ -276,6 +276,10 @@ def build_surfboards(n: int, tank_z_min: float, tank_z_max: float) -> np.ndarray
         ax_y = -cos_a
         ax_z = 0.0
 
+        cx = column_r * cos_a + dr_rad * az_x
+        cy = column_r * sin_a + dr_rad * az_y
+        cz = z_centre + dz_vert
+
         rows.append([
             cx, cy, cz,
             ax_x, ax_y, ax_z,
@@ -286,6 +290,85 @@ def build_surfboards(n: int, tank_z_min: float, tank_z_max: float) -> np.ndarray
         ])
 
     return np.array(rows, dtype=np.float32)
+
+
+def build_surfboard_housings(surfboard_data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Build LAPPD housing arrays positioned in front of each surfboard.
+
+    Each housing is offset from its surfboard along local_Z (radially inward)
+    and shares the same local axes (aligned straight, not rotated).  The
+    three housings are staggered vertically so the leftmost (45°) sits higher,
+    the rightmost (135°) lower, and the centre (90°) at mid-Z, forming a
+    diagonal in the visualisation frame.
+
+    Parameters
+    ----------
+    surfboard_data : np.ndarray
+        ``(S, 16)`` float32 — oriented-box surfboard data from build_surfboards().
+
+    Returns
+    -------
+    housing_data : np.ndarray  ``(S, 16)`` float32 — lappd_housing_data layout.
+    annie_data   : np.ndarray  ``(S, 7)`` float32  — annie_lappd_data layout.
+    """
+    from annieray.lappd_model import HOUSING_HALF, PC_LOCAL, PC_HALF
+
+    n = surfboard_data.shape[0]
+    if n == 0:
+        return np.empty((0, 16), dtype=np.float32), np.empty((0, 7), dtype=np.float32)
+
+    housing_data = np.empty((n, 16), dtype=np.float32)
+    annie_data = np.empty((n, 7), dtype=np.float32)
+
+    gap = 50.0  # mm between surfboard back face and housing front face
+    hhx, hhy, hhz = HOUSING_HALF  # (165, 215, 30)
+
+    # Vertical stagger: leftmost (45°) higher, rightmost (135°) lower, centre at mid-Z
+    z_diag_offsets = [800.0, 0.0, -800.0] if n == 3 else [0.0]
+
+    for i in range(n):
+        row = surfboard_data[i]
+        cx, cy, cz = row[0], row[1], row[2]
+        ax = row[3:6]
+        ay = row[6:9]
+        az = row[9:12]
+        shz = row[14]  # surfboard half_z (thickness)
+
+        # Offset centre along local_Z (radially inward)
+        offset = shz + gap + hhz
+        hcx = cx + offset * az[0]
+        hcy = cy + offset * az[1]
+        hcz = cz + offset * az[2]
+
+        # Vertical stagger along local_Y (global Z)
+        hcz += z_diag_offsets[i]
+
+        # Use surfboard axes directly (aligned straight, no rotation)
+        hax = ax
+        hay = ay
+        haz = az
+
+        # PC centre = housing centre + PC_LOCAL in housing local frame
+        plx, ply, plz = PC_LOCAL  # (0, -45, 3.5)
+        pcx = hcx + plx * hax[0] + ply * hay[0] + plz * haz[0]
+        pcy = hcy + plx * hax[1] + ply * hay[1] + plz * haz[1]
+        pcz = hcz + plx * hax[2] + ply * hay[2] + plz * haz[2]
+
+        housing_data[i] = [
+            hcx, hcy, hcz,
+            hax[0], hax[1], hax[2],
+            hay[0], hay[1], hay[2],
+            haz[0], haz[1], haz[2],
+            hhx, hhy, hhz,
+            0.0,
+        ]
+        annie_data[i] = [
+            pcx, pcy, pcz,
+            haz[0], haz[1], haz[2],  # PC normal = local_Z (inward)
+            PC_HALF[0],
+        ]
+
+    return housing_data, annie_data
 
 
 def build_geometry(
@@ -383,6 +466,9 @@ def build_geometry(
             lappd_sources = [tuple(manifest.lappd_candidates[i].center) for i in DEFAULT_LAPPD_INDICES
                             if i < len(manifest.lappd_candidates)]
 
+    # ---- Surfboard obscurant panels (needed before Stage 5) ----
+    surfboard_data = build_surfboards(n_surfboards, tank_z_min, tank_z_max)
+
     # ---- Stage 4: build default LAPPD rectangles ----
     # Each LAPPD is a square photocathode rectangle at a candidate position
     # from the STEP manifest.  The ANNIE model replaces one of these with
@@ -456,6 +542,14 @@ def build_geometry(
             if annie_lappd_data.shape[0] > 0:
                 pmt_loader.rotate_z(annie_lappd_data[:, 0:3], det_rotation_deg)
                 pmt_loader.rotate_z(annie_lappd_data[:, 3:6], det_rotation_deg)
+
+    # ---- Stage 5b: surfboard-mounted LAPPD housings ----
+    # Builds a housing in front of each surfboard (independent of Stage 5 housing source).
+    if lappd_model == "annie" and n_surfboards > 0:
+        sb_housing, sb_annie = build_surfboard_housings(surfboard_data)
+        if sb_housing.shape[0] > 0:
+            lappd_housing_data = np.concatenate([lappd_housing_data, sb_housing], axis=0)
+            annie_lappd_data = np.concatenate([annie_lappd_data, sb_annie], axis=0)
 
     # ---- Stage 6: build detector registry ----
     # Creates a list of DetectorInfo objects with stable IDs (WCSim TubeIDs
@@ -546,9 +640,6 @@ def build_geometry(
     # Default: all structure mesh triangles are TEFLON (ID 4)
     n_tris = tris.shape[0]
     mesh_material_ids = np.full(n_tris, 4, dtype=np.int32) if n_tris > 0 else np.zeros(0, dtype=np.int32)
-
-    # ---- Surfboard obscurant panels (optional) ----
-    surfboard_data = build_surfboards(n_surfboards, tank_z_min, tank_z_max)
 
     return Geometry(
         mesh_vertices=verts,
@@ -927,6 +1018,45 @@ def _ray_box_intersect(
         is_front = 1 if entry_face == 1 else 0
 
     return hit, t_hit, is_front
+
+
+@ti.func
+def _box_hit_normal(hx, hy, hz, cx, cy, cz,
+                    ax_x, ax_y, ax_z,
+                    ay_x, ay_y, ay_z,
+                    az_x, az_y, az_z,
+                    hhx, hhy, hhz):
+    """Outward-facing unit normal at a point on an oriented box surface.
+
+    Transforms the hit point to the box local frame, determines which
+    face was hit (the one closest to its half-extent), and returns the
+    outward-facing normal in world coordinates.
+    """
+    dx = hx - cx
+    dy = hy - cy
+    dz = hz - cz
+    lx = dx * ax_x + dy * ax_y + dz * ax_z
+    ly = dx * ay_x + dy * ay_y + dz * ay_z
+    lz = dx * az_x + dy * az_y + dz * az_z
+
+    d_x = ti.abs(ti.abs(lx) - hhx)
+    d_y = ti.abs(ti.abs(ly) - hhy)
+    d_z = ti.abs(ti.abs(lz) - hhz)
+
+    nx_l = 0.0
+    ny_l = 0.0
+    nz_l = 0.0
+    if d_x <= d_y and d_x <= d_z:
+        nx_l = 1.0 if lx > 0 else -1.0
+    elif d_y <= d_z:
+        ny_l = 1.0 if ly > 0 else -1.0
+    else:
+        nz_l = 1.0 if lz > 0 else -1.0
+
+    wx = nx_l * ax_x + ny_l * ay_x + nz_l * az_x
+    wy = nx_l * ax_y + ny_l * ay_y + nz_l * az_y
+    wz = nx_l * ax_z + ny_l * ay_z + nz_l * az_z
+    return wx, wy, wz
 
 
 # ---- Local-coordinate helpers (for use in the kernel loop) ----
@@ -1548,7 +1678,7 @@ def trace_kernel(
                 best_lv = vv
                 best_mat = 2  # PHOTOCATHODE (ANNIE LAPPD)
 
-        # ---- Surfboard obscurant panels (absorbing) ----
+        # ---- Surfboard obscurant panels (PVC material, configurable optics) ----
         for s in range(n_surfboards):
             scx = surfboard_data[s, 0]
             scy = surfboard_data[s, 1]
@@ -1577,15 +1707,21 @@ def trace_kernel(
 
             if sb_hit and t_sb > 1e-6 and t_sb < best_t:
                 best_t = t_sb
-                best_hit = CID_NO_HIT
+                best_hit = CID_INNER_STRUCTURE
                 best_x = ox + dx * t_sb
                 best_y = oy + dy * t_sb
                 best_z = oz + dz * t_sb
-                best_nx = 0.0
-                best_ny = 0.0
-                best_nz = 0.0
+                best_nx, best_ny, best_nz = _box_hit_normal(
+                    best_x, best_y, best_z,
+                    scx, scy, scz,
+                    ax_x, ax_y, ax_z,
+                    ay_x, ay_y, ay_z,
+                    az_x, az_y, az_z,
+                    shx, shy, shz,
+                )
                 best_det_idx = -1
                 best_det_sys = DET_SYS_NONE
+                best_mat = 3  # MaterialID.PVC
 
         hit, t_hit, nx, ny, nz = _ray_tank_intersect(
             ox, oy, oz, dx, dy, dz,
