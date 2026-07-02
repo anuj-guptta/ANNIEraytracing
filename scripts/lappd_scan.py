@@ -77,12 +77,12 @@ def main():
         z_idx = {v: i for i, v in enumerate(u_z)}
         maps = []
         for li in lappd_indices:
-            z2d = np.full((nz, nx), np.nan)
+            z2d = np.zeros((nz, nx))
             for _, row in muons.iterrows():
                 ev = int(row["event_id"])
                 xi, zi = x_idx[row["pos_x"]], z_idx[row["pos_z"]]
                 z2d[zi, xi] = hit_counts.get((ev, li), 0)
-            maps.append(z2d)
+            maps.append(np.ma.masked_where(z2d == 0, z2d))
 
     # Plot
     fig, axes = plt.subplots(1, n_lappds, figsize=(6 * n_lappds, 5),
@@ -93,13 +93,16 @@ def main():
     if gridded:
         vmax = max(m.max() for m in maps) if maps else 1
 
+    cmap = plt.cm.plasma.copy()
+    cmap.set_bad("white")
+
     for i, li in enumerate(lappd_indices):
         ax = axes[i]
         label = lappd_labels[i] if i < len(lappd_labels) else f"LAPPD {li}"
 
         if gridded:
             im = ax.pcolormesh(u_x, u_z, maps[i], shading="auto",
-                               cmap="plasma", vmin=vmin, vmax=vmax)
+                               cmap=cmap, vmin=vmin, vmax=vmax)
             ax.set_xlabel("muon start x (mm)")
             ax.set_ylabel("muon start z (mm)")
         else:
@@ -108,8 +111,8 @@ def main():
             for _, row in muons.iterrows():
                 ev = int(row["event_id"])
                 vals.append(hit_counts.get((ev, li), 0))
-            sc = ax.scatter(xs, zs, c=vals, cmap="plasma", s=40,
-                            edgecolors="white", linewidth=0.3)
+            sc = ax.scatter(xs, zs, c=vals, cmap=cmap, s=40,
+                            edgecolors="white", linewidth=0.3, vmin=0)
             ax.set_xlabel("muon start x (mm)")
             ax.set_ylabel("muon start z (mm)")
 
