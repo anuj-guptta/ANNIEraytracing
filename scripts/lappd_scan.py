@@ -1,4 +1,4 @@
-"""Plot LAPPD hit counts as a 2D heatmap over muon vertex (x, z).
+"""Plot LAPPD hit counts (or % of max) as a 2D heatmap over muon vertex.
 
 Assumes the batch was run with a regular grid of muon positions
 (via --muon-file) so that unique x and z values form a rectangular
@@ -6,6 +6,7 @@ grid.  Produces one panel per ANNIE LAPPD (3 panels).
 
 Usage:
     python scripts/lappd_scan.py results/
+    python scripts/lappd_scan.py --pct results/   # show % of peak per LAPPD
 """
 
 import sys
@@ -26,11 +27,13 @@ def load_data(output_dir: Path):
 
 
 def main():
-    if len(sys.argv) < 2:
+    pct_mode = "--pct" in sys.argv
+    args = [a for a in sys.argv if not a.startswith("--")]
+    if len(args) < 2:
         print(f"Usage: {sys.argv[0]} <batch_output_dir>")
         return
 
-    output_dir = Path(sys.argv[1])
+    output_dir = Path(args[1])
     hits, muons, det = load_data(output_dir)
 
     # Identify ANNIE LAPPDs (system_code == 2 in detectors.csv)
@@ -84,6 +87,14 @@ def main():
                 z2d[zi, xi] = hit_counts.get((ev, li), 0)
             maps.append(np.ma.masked_where(z2d == 0, z2d))
 
+        if pct_mode:
+            normed = []
+            for m in maps:
+                mx = m.max()
+                normed.append(m / mx * 100 if mx > 0 else m)
+            maps = normed
+            print("Displaying normalized (% of peak per LAPPD)")
+
     # Plot
     fig, axes = plt.subplots(1, n_lappds, figsize=(6 * n_lappds, 5),
                              squeeze=False)
@@ -91,7 +102,10 @@ def main():
 
     vmin, vmax = 0, 0
     if gridded:
-        vmax = max(m.max() for m in maps) if maps else 1
+        if pct_mode:
+            vmin, vmax = 0, 100
+        else:
+            vmax = max(m.max() for m in maps) if maps else 1
 
     cmap = plt.cm.plasma.copy()
     cmap.set_bad("white")
@@ -107,24 +121,29 @@ def main():
             ax.set_ylabel("muon start z (mm)")
         else:
             # Fallback: scatter
-            vals = []
-            for _, row in muons.iterrows():
-                ev = int(row["event_id"])
-                vals.append(hit_counts.get((ev, li), 0))
+            vals = np.array([
+                hit_counts.get((int(row["event_id"]), li), 0)
+                for _, row in muons.iterrows()
+            ])
+            if pct_mode:
+                mx = vals.max()
+                vals = vals / mx * 100 if mx > 0 else vals
             sc = ax.scatter(xs, zs, c=vals, cmap=cmap, s=40,
-                            edgecolors="white", linewidth=0.3, vmin=0)
+                            edgecolors="white", linewidth=0.3, vmin=vmin, vmax=vmax)
             ax.set_xlabel("muon start x (mm)")
             ax.set_ylabel("muon start z (mm)")
 
         ax.set_title(f"{label}\nindex={li}")
         ax.set_aspect("equal")
 
+        cbar_label = "LAPPD hits (% of peak)" if pct_mode else "LAPPD hits"
         if gridded:
-            fig.colorbar(im, ax=ax, label="LAPPD hits")
+            fig.colorbar(im, ax=ax, label=cbar_label)
         else:
-            fig.colorbar(sc, ax=ax, label="LAPPD hits")
+            fig.colorbar(sc, ax=ax, label=cbar_label)
 
-    fig.suptitle("LAPPD hit counts vs muon vertex (x, z)", fontsize=14)
+    title = "LAPPD hit counts (% of peak) vs muon vertex (x, z)" if pct_mode else "LAPPD hit counts vs muon vertex (x, z)"
+    fig.suptitle(title, fontsize=14)
     plt.tight_layout()
     plt.show()
 
