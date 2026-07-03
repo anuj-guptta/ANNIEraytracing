@@ -1,9 +1,13 @@
-# Linux Installation (CPU, no GPU required)
+# Linux Installation
 
-This project is GPU-accelerated via [Taichi](https://taichi-lang.org/), but
-Taichi also runs on CPU with no changes needed — all our launch code already
-defaults to `ti.cpu`.  The interactive visualiser needs a browser but no
-special graphics hardware.
+This project uses [Taichi](https://taichi-lang.org/) for ray tracing.  Taichi
+auto-detects CUDA (NVIDIA GPU), Vulkan, or Metal backends, and falls back to
+CPU if none are found — no code changes needed either way.  All launch code
+defaults to `ti.cpu`; with a GPU you can switch to `ti.cuda` for roughly
+5-10× faster batch simulations (see step 6).
+
+The interactive 3D viewer needs a browser for WebGL rendering but no GPU on
+the server for compute.
 
 ## Prerequisites
 
@@ -15,6 +19,12 @@ special graphics hardware.
   - Debian/Ubuntu: `apt install build-essential cmake`
   - Fedora: `dnf install gcc-c++ cmake`
   - Arch: `pacman -S base-devel cmake`
+- **NVIDIA GPU owners only — CUDA toolkit:**
+  - Debian/Ubuntu: `sudo apt install nvidia-cuda-toolkit`
+  - Fedora: `sudo dnf install cuda-toolkit`
+  - Arch: `sudo pacman -S cuda`
+  - Or download from <https://developer.nvidia.com/cuda-downloads>
+  - Verify with: `nvcc --version`
 
 ## 1. Clone and initialise submodules
 
@@ -51,6 +61,9 @@ These are only needed if you don't already have them — lxml's pip wheel may
 already bundle them on your platform.
 
 ## 4. Install Python dependencies
+
+Taichi works on both GPU and CPU from the same pip package.  No separate
+CUDA-wheel is needed — the `taichi` pip install is universal.
 
 **x86_64 (Intel/AMD) — simple:**
 
@@ -100,25 +113,45 @@ pip install -e . --no-deps
 
 ```bash
 python -c "import annieray; print('OK')"
+# Optional — check Taichi backend:
+python -c "import taichi as ti; ti.init(); print(ti.lang.impl.current_cfg().arch)"
 ```
 
-You should see `OK` with no errors.  If cadquery is missing, the package
-will still import — cadquery is only used when `--step` or `--manifest`
-are passed on the command line.
+You should see `OK` with no errors.  The Taichi arch check will print
+`x64` (CPU), `cuda` (NVIDIA GPU), or similar.  If cadquery is missing,
+the package will still import — cadquery is only used when `--step` or
+`--manifest` are passed on the command line.
 
 ## 6. Run a test simulation
+
+On CPU (any machine):
 
 ```bash
 python -m annieray batch --events 10 --photons-per-cm 50
 ```
 
-This runs without a GPU and writes results to `results/`.  Expected output:
+Expected output:
 
 ```
 Wrote results/photon_hits.parquet (NNNN photon rows)
 Wrote results/muon_truth.parquet (10 muon truth rows)
 Done.
 ```
+
+**With an NVIDIA GPU — switch to CUDA for 5-10× speedup:**
+
+```bash
+python -c "
+import taichi as ti
+ti.init(arch=ti.cuda)
+from annieray.cli import main
+main()
+" batch --events 500 --photons-per-cm 150
+```
+
+Or set the arch directly in a one-off script.  For routine GPU use you can
+edit the `ti.init(arch=ti.cpu)` calls in `annieray/cli.py` and
+`annieray/viz_server.py` to `ti.cuda`.
 
 ### With PMT CSV and surfboard LAPPDs
 
@@ -134,7 +167,9 @@ python -m annieray batch \
 ## 7. Interactive visualiser
 
 The 3D viewer runs as a local web server — it serves a Three.js page to
-your browser.  No GPU compute is needed on the server, just CPU ray tracing.
+your browser.  The Taichi ray tracing runs on the server (CPU or GPU); the
+browser only does WebGL rendering of the scene.  No special server GPU is
+needed for the viewer.
 
 ```bash
 python -m annieray viz-server \
@@ -153,5 +188,6 @@ WebGL for the Three.js rendering.
 | `taichi.lang.exception.TaichiCompilationError: ...` | Taichi JIT needs C++ tools | `apt install build-essential cmake` |
 | `ModuleNotFoundError: No module named 'cadquery'` | ARM Linux + no conda | Install via conda-forge (section 4) or use `--pmt-csv` workflow (doesn't need cadquery) |
 | `Cannot open self /usr/bin/python3` | System Python too old | Install Python 3.11+ from deadsnakes PPA or python.org |
-| Performance warning from Taichi | No GPU detected | Normal — CPU mode is expected; ~2-5× slower than GPU but still usable |
+| `import taichi` crashes or `ti.cuda` unavailable | CUDA not installed or incompatible | Run with CPU only (default).  Taichi prints a clear error if it can't find a requested backend. |
+| Performance warning from Taichi, arch = `x64` | No GPU detected | Normal — CPU mode is ~2-5× slower than GPU.  If you have an NVIDIA card, install CUDA toolkit. |
 | `pyarrow.lib.ArrowInvalid: ...` | Corrupt parquet from killed job | Re-run with `--events` smaller or longer timeout |
