@@ -1,13 +1,15 @@
-"""LAPPD hit counts per angle as 3x3 sub-grids over muon vertex.
+"""LAPPD hit counts per angle as N×N sub-grids over muon vertex.
 
-Each scan position shows a 3x3 grid of small colored boxes, one per
-muon direction angle in the vertical x horizontal (±22.5, 0) grid.
+Each scan position shows an N×N grid of small colored boxes, one per
+muon direction angle.  N is auto-detected from the batch output:
+each (x,z) position must have N×N events.
 
 Usage:
     python scripts/lappd_scan_angled.py results/
     python scripts/lappd_scan_angled.py --pct results/
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -18,8 +20,6 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from matplotlib.colors import Normalize
 
-ANGLE_LABELS_VERT = ["+22.5°", "0°", "−22.5°"]
-ANGLE_LABELS_HORIZ = ["−22.5°", "0°", "+22.5°"]
 SUB_SIZE_FRAC = 0.55  # sub-grid / grid-spacing ratio
 
 
@@ -31,24 +31,45 @@ def load_data(output_dir: Path):
 
 
 def build_cell_maps(muons, hit_counts, lappd_indices):
-    """Group events by (pos_x, pos_z), sort by event_id, build 3x3 arrays."""
+    """Group events by (pos_x, pos_z), sort by event_id, build N×N arrays.
+
+    Returns (cell_maps, N) where cell_maps[li][(px, pz)] is an N×N array.
+    """
     grouped = muons.groupby(["pos_x", "pos_z"], sort=False)
     cell_maps = {li: {} for li in lappd_indices}
     n_positions = 0
+    detected_N = None
+
     for (px, pz), group in grouped:
         group = group.sort_values("event_id")
-        if len(group) < 9:
+        M = len(group)
+        N = int(math.isqrt(M))
+        if N * N != M:
+            print(f"Warning: group at ({px}, {pz}) has {M} events "
+                  f"(not a perfect square), skipping")
             continue
-        # Take first 9 events as the 3x3 tile (angle scan order)
+        if detected_N is None:
+            detected_N = N
+        elif N != detected_N:
+            print(f"Warning: inconsistent N at ({px}, {pz}) — "
+                  f"expected {detected_N}, got {N}, skipping")
+            continue
+
         for li in lappd_indices:
-            arr = np.zeros((3, 3))
-            for k in range(9):
+            arr = np.zeros((N, N))
+            for k in range(N * N):
                 ev = int(group.iloc[k]["event_id"])
-                arr[k // 3, k % 3] = hit_counts.get((ev, li), 0)
+                arr[k // N, k % N] = hit_counts.get((ev, li), 0)
             cell_maps[li][(float(px), float(pz))] = arr
         n_positions += 1
-    print(f"Built {n_positions} position tiles ({n_positions * 9} events)")
-    return cell_maps
+
+    if detected_N is None:
+        print("Error: no valid position tiles found")
+        return {}, 0
+
+    print(f"Built {n_positions} position tiles ({n_positions} × {detected_N}² events, "
+          f"N={detected_N})")
+    return cell_maps, detected_N
 
 
 def main():
@@ -76,7 +97,9 @@ def main():
         return
     hit_counts = lappd_hits.groupby(["event_id", "detector_index"]).size()
 
-    cell_maps = build_cell_maps(muons, hit_counts, lappd_indices)
+    cell_maps, N = build_cell_maps(muons, hit_counts, lappd_indices)
+    if N == 0:
+        return
 
     # Determine grid spacing from unique sorted positions
     positions = list(cell_maps[lappd_indices[0]].keys())
@@ -88,8 +111,9 @@ def main():
     dz = np.diff(u_z).min() if len(u_z) > 1 else 200
     grid_spacing = min(dx, dz)
     sub_size = grid_spacing * SUB_SIZE_FRAC
-    cell_w = sub_size / 3
-    print(f"Grid spacing {grid_spacing} mm, sub-grid {sub_size:.0f} mm, cells {cell_w:.0f} mm")
+    cell_w = sub_size / N
+    print(f"Grid spacing {grid_spacing} mm, sub-grid {sub_size:.0f} mm, "
+          f"cells {cell_w:.1f} mm")
 
     # Color mapping
     all_vals = []
@@ -125,8 +149,8 @@ def main():
         for (px, pz), arr in cell_maps[li].items():
             origin_x = px - sub_size / 2
             origin_z = pz - sub_size / 2
-            for ri in range(3):
-                for ci in range(3):
+            for ri in range(N):
+                for ci in range(N):
                     val = arr[ri, ci]
                     if pct_mode:
                         val_pct = val / lappd_max[li] * 100
@@ -155,7 +179,8 @@ def main():
             ax=ax, label=cbar_label
         )
 
-    title = "LAPPD hits per angle (% of peak)" if pct_mode else "LAPPD hits per angle"
+    title_suffix = f" (N={N})" if N != 3 else ""
+    title = f"LAPPD hits per angle{title_suffix}" if not pct_mode else f"LAPPD hits per angle (% of peak){title_suffix}"
     fig.suptitle(title, fontsize=14)
     plt.tight_layout()
     plt.show()
