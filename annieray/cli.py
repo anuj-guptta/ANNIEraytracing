@@ -172,9 +172,16 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--surfboard", type=int, default=0, choices=[0, 1, 3],
                      help="Number of obscurant PVC surfboards (0, 1, or 3)")
     fit.add_argument("--grid-theta", type=str, default="0 180 19",
-                     help="Theta range: 'start stop steps' in deg (default: 0 180 19 → 10° steps)")
+                     help="Theta range: 'start stop steps' in deg (default: 0 180 19)")
     fit.add_argument("--grid-phi", type=str, default="0 360 37",
-                     help="Phi range: 'start stop steps' in deg (default: 0 360 37 → 10° steps)")
+                     help="Phi range: 'start stop steps' in deg (default: 0 360 37)")
+    fit.add_argument("--theta-window", type=float, default=None,
+                     help="Theta half-window (deg) around true direction. "
+                          "Overrides --grid-theta range.  Use with --grid-steps.")
+    fit.add_argument("--phi-window", type=float, default=None,
+                     help="Phi half-window (deg).  Defaults to --theta-window value.")
+    fit.add_argument("--grid-steps", type=int, default=41,
+                     help="Number of steps per axis in windowed mode (default: 41)")
     fit.add_argument("--photons-per-cm", type=int, default=None,
                      help="Photons per cm for each hypothesis evaluation (default: auto-detect from muon_truth)")
     fit.add_argument("--fix-vertex", type=str, default=None,
@@ -191,7 +198,9 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--save-grid", type=Path, default=None,
                      help="Save likelihood grid to NPZ file")
     fit.add_argument("--show", action="store_true",
-                     help="Show polar plot of likelihood surface")
+                     help="Show plot of likelihood surface")
+    fit.add_argument("--polar", action="store_true",
+                     help="Force polar projection (default: rectangular for zoomed-in, polar for full-sky)")
 
     return p
 
@@ -547,11 +556,32 @@ def fit_command(args: argparse.Namespace) -> None:
     )
 
     # Parse grid ranges
+    print(f"Loading observed data for event {args.event}...")
+    observed = load_observed_event(args.h5, args.event)
+
     theta_range = _parse_range(args.grid_theta)
     phi_range = _parse_range(args.grid_phi)
-    print(f"  Grid: θ∈[{theta_range[0]:.0f},{theta_range[1]:.0f}]×{theta_range[2]} "
-          f"φ∈[{phi_range[0]:.0f},{phi_range[1]:.0f}]×{phi_range[2]}")
 
+    # Windowed mode: centre on true/known direction
+    if args.theta_window is not None:
+        phi_window = args.phi_window if args.phi_window is not None else args.theta_window
+        centre_theta = observed.true_theta
+        centre_phi = observed.true_phi
+        if centre_theta is None:
+            print("Error: --theta-window requires a known true direction "
+                  "(muon_truth in HDF5)")
+            return
+        steps = args.grid_steps
+        t_start = centre_theta - args.theta_window
+        t_end = centre_theta + args.theta_window
+        p_start = centre_phi - phi_window
+        p_end = centre_phi + phi_window
+        theta_range = (t_start, t_end, steps)
+        phi_range = (p_start, p_end, steps)
+
+    print(f"  Grid: θ∈[{theta_range[0]:.1f},{theta_range[1]:.1f}]×{theta_range[2]} "
+          f"φ∈[{phi_range[0]:.1f},{phi_range[1]:.1f}]×{phi_range[2]}")
+    
     # Parse fix-vertex
     fix_vertex = None
     if args.fix_vertex:
@@ -560,9 +590,6 @@ def fit_command(args: argparse.Namespace) -> None:
             print("Error: --fix-vertex requires 3 floats: x y z")
             return
         fix_vertex = tuple(float(p) for p in parts)
-
-    print(f"Loading observed data for event {args.event}...")
-    observed = load_observed_event(args.h5, args.event)
 
     print(f"  True direction: θ={observed.true_theta:.1f}°, φ={observed.true_phi:.1f}°")
     if observed.true_pos:
@@ -616,8 +643,14 @@ def fit_command(args: argparse.Namespace) -> None:
 
     if args.show:
         try:
-            from scripts.fit_viewer import plot_polar
-            plot_polar(result)
+            from scripts.fit_viewer import plot_polar, plot_rectangular, is_full_sky
+            import matplotlib.pyplot as plt
+            use_polar = args.polar or is_full_sky(result)
+            if use_polar:
+                plot_polar(result)
+            else:
+                plot_rectangular(result)
+            plt.show()
         except ImportError:
             print("  --show requires scripts/fit_viewer.py (not found)")
 
