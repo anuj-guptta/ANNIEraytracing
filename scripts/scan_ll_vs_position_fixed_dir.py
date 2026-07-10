@@ -116,7 +116,7 @@ def main() -> None:
 
     # Output
     parser.add_argument("--clip", type=float, default=20,
-                        help="ΔLL clipping window for plot (default: 20)")
+                        help="Colormap range: [best_LL − clip, best_LL] (default: 20)")
     parser.add_argument("--save", type=Path, default=None,
                         help="Save results to NPZ file")
     parser.add_argument("--show", action="store_true",
@@ -327,10 +327,9 @@ def main() -> None:
 
         fig, ax = plt.subplots(figsize=(7, 6))
 
-        dll_clipped = np.clip(dll, -args.clip, 0)
-        im = ax.pcolormesh(XX, YY, dll_clipped, cmap="inferno_r",
+        im = ax.pcolormesh(XX, YY, ll, cmap="inferno_r",
                            shading="auto")
-        im.set_clim(-args.clip, 0)
+        im.set_clim(best_ll - args.clip, best_ll)
 
         # Markers
         if scan_mode == "xy":
@@ -352,11 +351,11 @@ def main() -> None:
             ax.set_xlabel("x (mm)")
             ax.set_ylabel("z (mm)")
 
-        ax.set_title(f"Δ log-likelihood (clipped at -{args.clip}), "
+        ax.set_title(f"Log-likelihood  (best: {best_ll:.0f}), "
                      f"θ={fix_theta:.0f}° φ={fix_phi:.0f}°")
         ax.set_aspect("equal")
         ax.legend(loc="upper right")
-        fig.colorbar(im, ax=ax, label="Δ log-likelihood")
+        fig.colorbar(im, ax=ax, label="Log-likelihood")
 
         plt.tight_layout()
         plt.show()
