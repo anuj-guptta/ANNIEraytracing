@@ -115,8 +115,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
 
     # Output
-    parser.add_argument("--clip", type=float, default=20,
-                        help="Colormap range: [best_LL − clip, best_LL] (default: 20)")
+    parser.add_argument("--clip", type=float, default=None,
+                        help="Colormap range: [best_LL − clip, best_LL].  "
+                             "If not set, auto-scale to the 5th–95th percentiles.")
     parser.add_argument("--save", type=Path, default=None,
                         help="Save results to NPZ file")
     parser.add_argument("--show", action="store_true",
@@ -329,7 +330,13 @@ def main() -> None:
 
         im = ax.pcolormesh(XX, YY, ll, cmap="inferno_r",
                            shading="auto")
-        im.set_clim(best_ll - args.clip, best_ll)
+        if args.clip is not None:
+            im.set_clim(best_ll - args.clip, best_ll)
+        else:
+            vmin, vmax = np.percentile(ll, [5, 95])
+            if vmax - vmin < 1:
+                vmin, vmax = ll.min(), ll.max()
+            im.set_clim(vmin, vmax)
 
         # Markers
         if scan_mode == "xy":
