@@ -5,34 +5,36 @@ Traces photons through a GDML-detailed inner structure, PMTs, LAPPDs, and
 obscurant surfboard panels, recording hit positions, local coordinates,
 arrival times, and wavelengths.
 
+Includes a **direction-fitting framework** with on-the-fly raytracing:
+Poisson charge likelihood + Gaussian time residual likelihood with grid
+scanning.
+
 ## Quick Start
 
 ```bash
-# Batch-mode simulation: Cherenkov photons from a muon track
+# Batch-mode simulation
 python -m annieray batch \
     --pmt-csv PMTPositions_Scan.txt \
     --events 100 --photons-per-cm 150
 
-# Interactive 3D viewer with ray tracing
+# Direction fit for a single event (grid scan, runs raytracing per hypothesis)
+python -m annieray fit output.h5 --event 0 --show
+
+# Zoomed-in fit around the true direction
+python -m annieray fit output.h5 --event 0 \
+    --theta-window 10 --grid-steps 21 --show
+
+# Interactive 3D viewer
 python -m annieray viz-server \
     --pmt-csv PMTPositions_Scan.txt --port 8080
-
-# With 3 surfboard obscurant panels and ANNIE LAPPD housing model
-python -m annieray viz-server \
-    --pmt-csv PMTPositions_Scan.txt \
-    --surfboard 3 --lappd-model annie
-
-# Build detector registry YAML (one-time setup for model coupling)
-python -m annieray build-detector-config \
-    --pmt-csv PMTPositions_Scan.txt -o detectors.yaml
 ```
 
 ## CLI Commands
 
 ### `batch` — Batch-mode event generation
 
-Runs N events on the GPU, writing results to Parquet files. No display
-server required.
+Runs N events on the GPU, writing results to a single HDF5 file. No
+display server required.
 
 ```
 python -m annieray batch [flags]
@@ -48,141 +50,162 @@ python -m annieray batch [flags]
 | `--photons-per-cm` | 150 | Photons per cm along the muon track |
 | `--batch-size` | 50 | Events per GPU launch (higher = faster) |
 | `--muon-fixed` | None | Fixed muon topology: `"x y z t0 dx dy dz"` (7 floats) |
-| `--muon-file` | None | File with one topology per line (`x y z t0 dx dy dz`) |
+| `--muon-file` | None | File with one topology per line |
 | `--surfboard` | 0 | PVC surfboard panels (`0`, `1`, or `3`) |
-| `--lappd-model` | `annie` | LAPPD geometry (`default` = bare rectangle, `annie` = housed) |
+| `--lappd-model` | `annie` | LAPPD geometry (`default` / `annie`) |
 | `--lappd-indices` | None | Comma-separated LAPPD candidate indices from STEP |
-| `--det-rotation` | 22.5 | Global Z-rotation (deg) aligning +Y with octagon corner |
-| `--z-offset` | 0.0 | Vertical offset applied to all PMT positions (mm) |
-| `--no-lappd` | false | Skip LAPPD rectangles entirely |
-| `--max-bounces` | 0 | Multi-bounce optics (0 = single bounce, 3 = up to 3 bounces) |
+| `--det-rotation` | 22.5 | Global Z-rotation (deg) |
+| `--z-offset` | 0.0 | Vertical offset (mm) |
+| `--no-lappd` | false | Skip LAPPD rectangles |
+| `--max-bounces` | 0 | Multi-bounce optics |
 | `--pmt-response` | false | Enable PMT digital model (SPE charge + TTS) |
-| `--full-wf` | false | Full waveform path for PMT response (requires `--pmt-response`) |
-| `--output-dir` | `results/` | Output directory for Parquet files |
-| `--no-record` | false | Skip writing per-event output files |
+| `--full-wf` | false | Full waveform path (requires `--pmt-response`) |
+| `--light-burst` | false | Isotropic light burst (instead of muon Cherenkov) |
+| `--burst-n-phots` | 1000 | Number of isotropic photons per burst |
+| `--burst-position` | None | Burst centre `"x y z"` (mm) |
+| `--output-dir` | `results/` | Output directory for HDF5 file |
+| `--no-record` | false | Skip writing per-event output |
 | `--wavelength` | 350.0 | Cherenkov photon wavelength (nm) |
-| `--seed` | None | Random seed for reproducibility |
+| `--optics-config` | None | YAML file with per-material optical properties |
+| `--seed` | None | Random seed |
 
-**Muon topology** — By default muons are sampled uniformly in position
-and direction inside the tank. With `--muon-fixed` you specify a single
-topology for every event:
+**Output** — A single `output.h5` containing tables:
 
-```bash
-python -m annieray batch \
-    --pmt-csv PMTPositions_Scan.txt \
-    --muon-fixed "0 -45 2000 0 0 0 -1" \
-    --events 1000 --photons-per-cm 150
-```
+| Table | Contents |
+|-------|----------|
+| `photon_hits` | Per-photon hit records |
+| `pmt_responses` | Digitised charges and hit times (when `--pmt-response`) |
+| `muon_truth` | Per-event truth (position, direction, track length, etc.) |
+| `detectors` | Detector registry (system, index, position, label, panel) |
+| `metadata` | Tank dimensions and geometry parameters |
 
-The 7 values are: `x y z t0 dx dy dz` (t0 in ns, position in mm,
-direction as a unit vector).
+### `fit` — Direction fitting from batch output
 
-**Output files** — Two Parquet files in `--output-dir`:
-
-- `photon_hits.parquet` — per-photon hit records with event_id, position,
-  normal, component, detector info, local coordinates, arrival time,
-  wavelength, and bounce count.
-- `pmt_responses.parquet` — when `--pmt-response` is used, per-PMT
-  digitised charges and hit times.
-
-### `viz-server` — Interactive 3D viewer
-
-Starts a local HTTP server with a Three.js frontend. Click on PMTs or
-surfboard panels to adjust positions in real time. Trace Cherenkov cones
-from a user-controlled muon.
+Runs an on-the-fly direction grid scan for a single event. Each hypothesis
+calls `trace_cherenkov()` independently to predict per-PMT hit counts,
+then evaluates the Poisson charge likelihood (+ optional Gaussian time
+residual likelihood).
 
 ```
-python -m annieray viz-server [flags]
+python -m annieray fit output.h5 [--event 0] [flags]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--gdml` | `PHASE2_INNER_STRUCTURE.gdml` | GDML structure mesh |
-| `--step` | None | STEP CAD manifest |
-| `--manifest` | None | Pre-cached component manifest JSON |
-| `--pmt-csv` | None | PMT position file |
-| `--det-rotation` | 22.5 | Global Z-rotation (deg) |
-| `--z-offset` | 0.0 | Vertical offset (mm) |
-| `--no-lappd` | false | Skip LAPPD rectangles |
-| `--lappd-model` | `annie` | LAPPD geometry model |
-| `--bottom-rot` | 45.0 | Extra Z-rotation for bottom PMTs (deg) |
-| `--bottom-spin` | 0.0 | Spin rotation for bottom PMTs (deg) |
-| `--surfboard` | 0 | PVC surfboard panels (`0`, `1`, or `3`) |
-| `--port` | 8080 | HTTP port |
-| `--host` | `0.0.0.0` | Bind address |
+| `--gdml` | `PHASE2_INNER_STRUCTURE_closed.gdml` | Geometry mesh |
+| `--pmt-csv` | No default | PMT position file |
+| `--event` | 0 | Event ID to fit |
+| `--grid-theta` | `"0 180 19"` | θ grid: `"start stop steps"` (deg) |
+| `--grid-phi` | `"0 360 37"` | φ grid: `"start stop steps"` (deg) |
+| `--theta-window` | None | ±half-width around true direction; overrides `--grid-theta` |
+| `--phi-window` | None | φ half-window; defaults to `--theta-window` |
+| `--grid-steps` | 41 | Steps per axis in windowed mode |
+| `--fix-vertex` | None | Fixed vertex `"x y z"` (mm) |
+| `--fix-t0` | None | Fixed t0 (ns) |
+| `--photons-per-cm` | auto-detect | Photons per cm for hypothesis evaluation |
+| `--use-time` | false | Include time residual likelihood |
+| `--time-sigma` | None | Per-PMT-type or global timing sigma (ns) |
+| `--alpha` | 1.0 | Scale factor for time likelihood |
+| `--seed` | 42 | RNG seed |
+| `--save-grid` | None | Save likelihood surface to NPZ |
+| `--show` | false | Show plot (auto: rectangular for zoom, polar for full-sky) |
+| `--polar` | false | Force polar projection |
 
-**Interactive features:**
-- **Muon controls**: set X/Y/Z position and theta/phi direction, then
-  click "Trace Cherenkov" to run the GPU kernel and see hit dots.
-- **PMT adjustment**: click any PMT → popup adjusts axial/tangential/
-  vertical position with live preview; save persists to `corrections.csv`.
-- **Surfboard adjustment**: click a surfboard panel → popup adjusts
-  vertical/radial/tangential position; reset restores default.
-- **LAPPD housing adjustment**: click a housing box → same popup pattern
-  for per-housing vertical/radial/tangential position.
-- **Toggles**: grey-structure, grey-PMT, grey-LAPPD modes; structure
-  opacity slider; LAPPD global dx/dy/dz correction (saves to
-  `lappd_corrections.csv`).
+**Plot type auto-detection:**
+- Full-sky grid (θ span > 170°, φ span > 350°) → polar
+- Zoomed-in grid → rectangular (Δθ × Δφ heatmap)
+
+### Other commands
+
+- **`viz-server`** — Interactive 3D viewer with Three.js frontend
+- **`viz-lappd`** — Standalone LAPPD module viewer
+- **`build-detector-config`** — Writes detector registry YAML
+
+## Analysis scripts
+
+Standalone plotting and scanning utilities in `scripts/`.
+
+### `fit_viewer.py`
+
+Reload and replot a saved likelihood surface from an NPZ file.
 
 ```bash
-# Full featured viewer
-python -m annieray viz-server \
-    --pmt-csv PMTPositions_Scan.txt \
-    --surfboard 3 --lappd-model annie \
-    --port 8080
+python scripts/fit_viewer.py grid.npz
+python scripts/fit_viewer.py grid.npz --clip 10 --polar
+python scripts/fit_viewer.py grid.npz --save figure.png
 ```
 
-### `build-detector-config` — Detector registry YAML
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--clip` | 20 | ΔLL clipping window |
+| `--polar` | false | Force polar projection |
+| `--rect` | false | Force rectangular projection |
+| `--save` | None | Save figure to file |
 
-Scans the geometry and writes a `detectors.yaml` mapping stable IDs to
-hardware info (position, direction, type, panel). Needed for coupling
-with external simulation frameworks.
+### `scan_ll_vs_position.py`
 
+Direction grid scan at each (x,z) spatial position. Produces 3-panel
+heatmaps: best LL, best θ, best φ vs position.
+
+```bash
+python scripts/scan_ll_vs_position.py output.h5 --event 0 \
+    --grid-x "1500 2500 11" --grid-z "1500 2500 11" \
+    --grid-theta "0 180 9" --grid-phi "0 360 9" \
+    --save scan_results.npz --show
 ```
-python -m annieray build-detector-config --pmt-csv PMTPositions_Scan.txt -o detectors.yaml
+
+### `scan_ll_vs_position_fixed_dir.py`
+
+Fixed-direction scan over (x,z) or (x,y) positions at ~0.5 s/position.
+Single raytracing call per position — much faster than running a full
+direction scan at each point.
+
+```bash
+# XZ scan
+python scripts/scan_ll_vs_position_fixed_dir.py output.h5 \
+    --grid-x "-500 500 11" --grid-z "1500 2500 11" --show
+
+# XY scan
+python scripts/scan_ll_vs_position_fixed_dir.py output.h5 \
+    --grid-x "-500 500 11" --grid-y "-500 500 11" --fix-z 2000 --show
 ```
 
-## Surfboard Obscurant Panels
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--grid-x` | `"0 2000 11"` | X range: `"start stop steps"` |
+| `--grid-y` | None | Y range (use with `--fix-z`) |
+| `--grid-z` | None | Z range (use with `--fix-y`) |
+| `--fix-y` | None | Fixed Y coordinate |
+| `--fix-z` | None | Fixed Z coordinate |
+| `--fix-theta` | auto-detect | Fixed θ from muon_truth |
+| `--fix-phi` | auto-detect | Fixed φ from muon_truth |
+| `--clip` | auto | Colormap range (5th–95th percentile by default) |
+| `--save` | None | Save results to NPZ |
+| `--show` | false | Show heatmap |
 
-PVC panels (2450 x 280 x 10 mm) mounted vertically at the forward
-octagon vertices (45°, 90°, 135°). They absorb photons and stop muon
-tracks. Configurable via `--surfboard {0,1,3}`.
+## Likelihood model
 
-When `--surfboard 3` is combined with `--lappd-model annie`, three
-LAPPD housings are automatically built in front of each panel, offset
-radially inward and staggered vertically (leftmost higher, rightmost
-lower, centre at mid-Z) to form a diagonal in the visualisation frame.
+### Poisson charge likelihood
 
-Each housing is clickable in the viz viewer for individual position
-adjustment (vertical/radial/tangential sliders).
+Uses the per-PMT hit count (`n_hits` from `pmt_responses`), an integer
+representing the number of detected photoelectrons.  The log-likelihood is:
 
-## LAPPD Housing Model
+$$LL_{\text{charge}} = \sum_i \left[ n_i \ln(\mu_i) - \mu_i - \ln(n_i!) \right]$$
 
-The `--lappd-model annie` flag replaces the default bare photocathode
-rectangle with the full Kandemir waterproof housing: a 5-sided acrylic
-box (330 x 430 x 60 mm) with an off-centre photocathode (191.5 x 191.5 mm)
-at local-Z = +3.5 mm from the housing centre.
+where `μ_i` is the expected number of hits from the hypothesis (computed
+by tracing Cherenkov photons) and `n_i` is the observed count.  PMTs with
+no observed hits contribute `-μ_i`.  Implemented in `annieray/likelihood.py`.
 
-The housing is built from the `LAPPDHousing` dataclass in
-`annieray/lappd_model.py` and stored in the geometry as
-`lappd_housing_data` (S, 16) and `annie_lappd_data` (S, 7) arrays,
-one row per housing instance.
+### Gaussian time residual likelihood
 
-## Interactive Position Correction
+When `--use-time` is set, the earliest photon arrival time at each PMT is
+compared to the expected time via:
 
-The viewer supports three levels of position adjustment:
+$$LL_{\text{time}} = -\frac{1}{2} \sum_i \frac{(t_i - t_{\text{exp},i})^2}{\sigma_i^2}$$
 
-1. **PMT corrections** — saved to `corrections.csv`. One row per PMT
-   (axial, tangential, vertical in the PMT local frame). Applied at
-   geometry load time and during trace operations.
-
-2. **LAPPD global correction** — saved to `lappd_corrections.csv`.
-   A single dx/dy/dz offset applied uniformly to all LAPPD housings.
-
-3. **Per-object sliders** — click any surfboard or LAPPD housing in
-   the 3D view for a popup with live-adjust sliders (vertical, radial,
-   tangential in the object's local frame). Adjustments update the
-   server-side geometry arrays in real time.
+with per-PMT-type transit time sigma from `PMT_TYPE_DEFAULTS` (ETEL=1.8,
+LUX=1.2, Hamamatsu=1.5, Watchboy=1.6, Watchman=1.0 ns).  The combined
+score is `LL = LL_charge + α · LL_time`.
 
 ## How the Ray Tracing Works
 
@@ -208,12 +231,12 @@ The viewer supports three levels of position adjustment:
                      ┌────────────┴────────────┐
                      v                         v
                 hits ndarray            expand with arrival_time
-                     |                   + wavelength + bounce
+                     |                  + wavelength + bounce
                      v
                write_hits() / BatchAccumulator
                      |
                      v
-               hits.parquet
+               output.h5
 ```
 
 ### The Taichi kernel (`trace_kernel`)
@@ -229,84 +252,62 @@ Each GPU thread processes one photon:
 5. **Scans all default LAPPDs** via oriented-rectangle intersection.
    Computes strip-aligned local coordinates (along/across strips).
 6. **Finds ANNIE LAPPD housings** via oriented-box slab intersection.
-   Side/back faces absorb; front face passes to a photocathode rectangle.
-7. **Scans surfboard panels** via oriented-box intersection. Hits are
-   recorded as `CID_INNER_STRUCTURE` with material ID 3 (PVC) for
-   multi-bounce optics evaluation.
+7. **Scans surfboard panels** via oriented-box intersection.
 8. **Finds the tank wall** via infinite-cylinder intersection.
 9. **Writes the nearest hit** with component ID, detector index/system,
    local coordinates, and material ID.
 
-### Multi-bounce optics
+## Muon direction conventions
+
+- **θ (theta)** — polar angle from vertical. 0° = downward (−z),
+  90° = horizontal (XY plane), 180° = upward (+z).
+- **φ (phi)** — azimuthal angle in XY plane. 0° = along +x,
+  90° = along +y.
+
+## Surfboard Obscurant Panels
+
+PVC panels (2450 x 280 x 10 mm) mounted vertically at the forward
+octagon vertices (45°, 90°, 135°). Configurable via `--surfboard {0,1,3}`.
+
+## LAPPD Housing Model
+
+The `--lappd-model annie` flag replaces the default bare photocathode
+rectangle with the full Kandemir waterproof housing: a 5-sided acrylic
+box (330 x 430 x 60 mm) with an off-centre photocathode (191.5 x 191.5 mm).
+
+## Multi-bounce optics
 
 With `--max-bounces N` (N > 0), `trace_with_optics()` manages N rounds
 of Fresnel reflection/transmission and diffuse reflection per material.
-Each bounce computes a new direction from the surface BRDF and retraces
-the ray, accumulating optical path length and maintaining the bounce
-count in the output.
-
-## Batch-Mode Simulations
-
-The `batch` command requires no display server. It:
-
-1. Builds the geometry once.
-2. For each event, draws a muon topology (position + direction).
-3. Generates Cherenkov photons along the muon track.
-4. Launches the GPU kernel on up to `--batch-size` events at once
-   (~2.7x speedup vs per-event launches).
-5. Collects hits and optionally runs the PMT digital model.
-6. Writes `photon_hits.parquet` and `pmt_responses.parquet`.
-
-### Output schema — `photon_hits.parquet`
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `event_id` | int64 | Event number |
-| `hit_flag` | int32 | 1 = hit, 0 = miss |
-| `t` | float32 | Path length (mm) |
-| `x, y, z` | float32 | Hit position (mm) |
-| `nx, ny, nz` | float32 | Surface normal |
-| `component_id` | int32 | 1=structure, 2=PMT, 3=LAPPD, 4=tank wall |
-| `detector_index` | int32 | Index into detector registry, -1 if none |
-| `detector_system` | int32 | 0=pmt, 1=lappd_default, 2=lappd_annie |
-| `local_u` | float32 | Along-strip (LAPPD) / polar angle (PMT) |
-| `local_v` | float32 | Across-strip (LAPPD) / azimuthal angle (PMT) |
-| `material_id` | int32 | Hit material (structure materials, PVC=3) |
-| `arrival_time` | float32 | Photon travel time (ns) |
-| `wavelength` | float32 | Photon wavelength (nm) |
-| `bounce_count` | int32 | Number of surface reflections |
-| `photon_id` | int64 | Sequential photon index within event |
-
-### PMT digital model
-
-When `--pmt-response` is set, `process_pmt_hits()` runs after tracing:
-
-- **Fast path** (default): assigns SPE charge (Gaussian-smear) and
-  transit time spread per PMT type. See `annieray/pmt_response.py`.
-- **Full waveform path** (`--full-wf`): synthesises SPE pulse trains
-  with realistic pulse shapes and a hit-finding algorithm.
-
-Output written to `pmt_responses.parquet` with columns: `event_id`,
-`detector_index`, `charge_pe`, `hit_time_ns`.
 
 ## Code Map
 
 | File | Role |
 |------|------|
-| `cli.py` | CLI parser, `batch`/`viz-server`/`build-detector-config` subcommands |
-| `tracer.py` | Geometry dataclass, `build_geometry()`, Taichi trace kernel, all intersection functions, `trace_cherenkov()`, multi-bounce `trace_with_optics()` |
-| `batch.py` | Batch-mode event loop, `BatchAccumulator` for Parquet output |
-| `cherenkov.py` | Vectorised Cherenkov photon generator (~13 ms for 60K photons) |
+| `cli.py` | CLI parser, all subcommands (`batch`, `fit`, `viz-server`, etc.) |
+| `tracer.py` | Geometry dataclass, `build_geometry()`, Taichi trace kernel, `trace_cherenkov()` |
+| `batch.py` | Batch-mode event loop, `BatchAccumulator` for HDF5 output |
+| `cherenkov.py` | Vectorised Cherenkov / isotropic photon generator |
+| `fitting.py` | `grid_scan_direction()`, `load_observed_event()`, `ScanResult`/`ObservedEvent` |
+| `likelihood.py` | Poisson charge + Gaussian time residual log-likelihood |
+| `io_h5.py` | HDF5 table I/O (load/save/append) |
 | `pmt_response.py` | PMT digital model — fast path and full-waveform path |
 | `lappd_response.py` | Taichi-accelerated LAPPD digitisation pipeline |
-| `lappd_model.py` | `LAPPDHousing` dataclass, housing geometry builder, `compute_housing_track_length()` |
+| `lappd_model.py` | `LAPPDHousing` dataclass, housing geometry builder |
 | `detectors.py` | `DetectorInfo`, `build_detector_registry()`, YAML I/O |
-| `output.py` | Parquet writer, hit schema |
+| `output.py` | HDF5 writer for hit data and detector config |
 | `gdml_parser.py` | GDML mesh parser (vertex/triangle arrays) |
 | `pmt_loader.py` | PMT CSV parser, mesh loader, hardware mesh builder |
 | `pmt_mesh.py` | PMT body/hardware mesh loading and array building |
 | `step_parser.py` | STEP CAD parser (component manifest) |
-| `viz_server.py` | Interactive Three.js viewer with real-time ray tracing |
+| `viz_server.py` | Interactive Three.js viewer |
 | `viz_lappd_server.py` | Standalone LAPPD module viewer |
 | `optics.py` | Optical material database, Fresnel/reflectance evaluation |
 | `_version.py` | Package version |
+| **Scripts** | |
+| `scripts/fit_viewer.py` | Polar/rectangular likelihood surface plot from NPZ |
+| `scripts/scan_ll_vs_position.py` | Direction scan at each (x,z) spatial position |
+| `scripts/scan_ll_vs_position_fixed_dir.py` | Fixed-direction scan over (x,z) or (x,y) |
+| `scripts/convert_to_h5.py` | Convert old parquet output directories to HDF5 |
+| `scripts/LAPPD_positionscan.py` | LAPPD hit heatmap from batch output |
+| `scripts/pmt_histograms.py` | Per-PMT charge/time histograms |
