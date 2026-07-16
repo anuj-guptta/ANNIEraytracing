@@ -30,6 +30,8 @@ geometry = None
 
 pmt_instance_data: dict | None = None   # from pmt_loader
 
+_last_trace_hits: np.ndarray | None = None  # full hit array for LAPPD readout
+
 # ---- PMT mesh caching (built from shared pmt_mesh module) ----
 _viz_caches = build_viz_caches()
 PMT_MESH_CACHE: dict[int, bytes] = {}
@@ -151,6 +153,8 @@ class VizHandler(BaseHTTPRequestHandler):
             self._handle_surfboard_adjust(data)
         elif path == "/api/lappd/adjust":
             self._handle_lappd_adjust(data)
+        elif path == "/api/lappd/readout":
+            self._handle_lappd_readout(data)
         else:
             self.send_error(404)
 
@@ -279,6 +283,38 @@ class VizHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
         else:
             self._send_json({"error": "invalid index"}, 400)
+
+    def _handle_lappd_readout(self, data):
+        _proc_lappd = None
+        try:
+            from annieray.lappd_response import process_hits as _proc_lappd
+        except ImportError:
+            self._send_json({"error": "lappd_response module not available"}, 400)
+            return
+
+        global _last_trace_hits
+        if _last_trace_hits is None:
+            self._send_json({"error": "no trace data available — trace first"}, 400)
+            return
+
+        # trace_cherenkov returns N_EXPANDED_COLS already
+        result = _proc_lappd(_last_trace_hits, rng_seed=data.get("seed", 42))
+        if not result:
+            self._send_json({"readouts": [], "message": "no LAPPD hits"})
+            return
+
+        # Serialise to JSON
+        readouts = []
+        for det_idx in sorted(result.keys()):
+            r = result[det_idx]
+            readouts.append({
+                "detector_index": int(det_idx),
+                "n_photons": int(r["n_photons"]),
+                "n_passed_qe": int(r["n_passed_qe"]),
+                "side0": r["side0"].tolist(),
+                "side1": r["side1"].tolist(),
+            })
+        self._send_json({"readouts": readouts})
 
     def _handle_lappd_adjust(self, data):
         idx = int(data["index"])
@@ -485,6 +521,8 @@ class VizHandler(BaseHTTPRequestHandler):
         hits = trace_cherenkov(
             (mx, my, mz), (dx, dy, dz), photons_per_cm, geometry, rng=rng,
         )
+        global _last_trace_hits
+        _last_trace_hits = hits
         elapsed = time.time() - t0
 
         total_hits = int(hits[:, 0].sum())
@@ -624,6 +662,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <label>LAPPD dz <input type="number" id="lappdDz" step="1" value="0" style="width:70px;"></label>
   <button id="saveLappdCorr">Save Correction</button>
   <button id="focusLAPPD" disabled>Focus on LAPPD</button>
+  <button id="showLappdReadout" disabled style="margin-top:4px;">Show LAPPD Readout</button>
   <label style="margin-top:6px;"><input type="checkbox" id="lappdGrey"> Grey LAPPD</label>
   <div id="surfboard-adjust" style="display:none;"></div>
   <hr style="margin:8px 0;border:none;border-top:1px solid rgba(0,0,0,0.1);">
@@ -1067,6 +1106,13 @@ async function doTrace() {
             + `tank <b>${c.tank}</b>) `
             + `<span style="color:#888">· ${photonsPerCm} ph/cm</span> `
             + `in ${data.time_ms} ms`;
+
+        // Enable LAPPD readout button if there are LAPPD hits
+        const roBtn = document.getElementById('showLappdReadout');
+        roBtn.disabled = (c.lappd === 0);
+        if (c.lappd > 0) {
+            roBtn.dataset.hasLappdHits = 'true';
+        }
     } catch (e) {
         traceResultEl.textContent = 'Trace failed: ' + e.message;
     } finally {
@@ -1074,6 +1120,119 @@ async function doTrace() {
         btn.textContent = 'Trace Cherenkov Photons';
     }
 }
+
+// ---- LAPPD Readout ----
+let _readoutData = [];      // full readouts array
+let _readoutIndex = 0;      // currently displayed index
+
+function renderReadoutCanvas(canvas, data28x256) {
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height;
+    const imgData = ctx.createImageData(w, h);
+
+    let vmin = Infinity, vmax = -Infinity;
+    for (let strip = 0; strip < 28; strip++) {
+        for (let tb = 0; tb < 256; tb++) {
+            const v = data28x256[strip][tb];
+            if (v > 0) { vmin = Math.min(vmin, v); vmax = Math.max(vmax, v); }
+        }
+    }
+    if (vmax <= vmin) { vmin = 0; vmax = 1; }
+    const range = vmax - vmin;
+
+    function thermal(t) {
+        t = Math.max(0, Math.min(1, t));
+        if (t < 0.25) { const s = t / 0.25; return [0, 0, s]; }
+        if (t < 0.50) { const s = (t - 0.25) / 0.25; return [s, 0, 1]; }
+        if (t < 0.75) { const s = (t - 0.50) / 0.25; return [1, s, 1 - s]; }
+        const s = (t - 0.75) / 0.25; return [1, 1, 1 - s];
+    }
+
+    for (let strip = 0; strip < 28; strip++) {
+        const row = Math.floor(strip * h / 28);
+        const nextRow = Math.floor((strip + 1) * h / 28);
+        for (let tb = 0; tb < 256; tb++) {
+            const v = data28x256[strip][tb];
+            const t = v > 0 ? Math.log1p(v - vmin) / Math.log1p(range) : 0;
+            const [r, g, b] = thermal(t);
+            const col = Math.floor(tb * w / 256);
+            const nextCol = Math.floor((tb + 1) * w / 256);
+            for (let py = row; py < nextRow; py++) {
+                for (let px = col; px < nextCol; px++) {
+                    const idx = (py * w + px) * 4;
+                    imgData.data[idx] = Math.round(r * 255);
+                    imgData.data[idx + 1] = Math.round(g * 255);
+                    imgData.data[idx + 2] = Math.round(b * 255);
+                    imgData.data[idx + 3] = 255;
+                }
+            }
+        }
+    }
+    ctx.putImageData(imgData, 0, 0);
+}
+
+function displayReadout(idx) {
+    const ro = _readoutData[idx];
+    const navEl = document.getElementById('lappdNavInfo');
+    const metaEl = document.getElementById('lappdReadoutMeta');
+    const prevBtn = document.getElementById('lappdPrev');
+    const nextBtn = document.getElementById('lappdNext');
+    navEl.textContent = `${idx + 1} / ${_readoutData.length}`;
+    metaEl.textContent = `LAPPD ${ro.detector_index} · ${ro.n_photons} photons, ${ro.n_passed_qe} passed QE`;
+    renderReadoutCanvas(document.getElementById('roCanvas0'), ro.side0);
+    renderReadoutCanvas(document.getElementById('roCanvas1'), ro.side1);
+    prevBtn.disabled = idx === 0;
+    nextBtn.disabled = idx === _readoutData.length - 1;
+}
+
+document.getElementById('showLappdReadout').addEventListener('click', async () => {
+    const btn = document.getElementById('showLappdReadout');
+    const popup = document.getElementById('lappd-readout-popup');
+    const metaEl = document.getElementById('lappdReadoutMeta');
+    btn.disabled = true;
+    btn.textContent = 'Processing…';
+    try {
+        const resp = await fetch('/api/lappd/readout', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({seed: Date.now()}),
+        });
+        const data = await resp.json();
+        if (!data.readouts || data.readouts.length === 0) {
+            metaEl.textContent = 'No LAPPD readout data available.';
+            popup.style.display = 'block';
+            return;
+        }
+        _readoutData = data.readouts;
+        _readoutIndex = 0;
+        displayReadout(0);
+        popup.style.display = 'block';
+    } catch (e) {
+        metaEl.textContent = 'Error: ' + e.message;
+        popup.style.display = 'block';
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Show LAPPD Readout';
+    }
+});
+
+document.getElementById('lappdPrev').addEventListener('click', () => {
+    if (_readoutIndex > 0) {
+        _readoutIndex--;
+        displayReadout(_readoutIndex);
+    }
+});
+
+document.getElementById('lappdNext').addEventListener('click', () => {
+    if (_readoutIndex < _readoutData.length - 1) {
+        _readoutIndex++;
+        displayReadout(_readoutIndex);
+    }
+});
+
+document.getElementById('lappdReadoutClose').addEventListener('click', () => {
+    document.getElementById('lappd-readout-popup').style.display = 'none';
+});
 
 // ---- Events ----
 thetaSlider.addEventListener('input', updateScene);
@@ -2359,6 +2518,26 @@ init();
   </div>
   <div>
     <button id="hReset">Reset</button>
+  </div>
+</div>
+
+<!-- LAPPD Readout popup -->
+<div id="lappd-readout-popup" style="display:none;position:fixed;bottom:140px;left:50%;transform:translateX(-50%);
+     background:rgba(240,242,245,0.95);color:#333;padding:12px 20px;border-radius:8px;font-size:12px;z-index:200;
+     backdrop-filter:blur(4px);border:1px solid rgba(0,0,0,0.12);box-shadow:0 4px 20px rgba(0,0,0,0.15);">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+    <span style="font-weight:bold;">LAPPD Readout</span>
+    <button id="lappdReadoutClose" style="background:none;border:none;font-size:16px;cursor:pointer;color:#666;padding:2px 6px;border-radius:4px;">&#10005;</button>
+  </div>
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;font-size:11px;">
+    <button id="lappdPrev" style="background:#888;color:#fff;border:none;border-radius:3px;padding:2px 8px;cursor:pointer;">&#9664;</button>
+    <span id="lappdNavInfo" style="color:#666;">1 / 1</span>
+    <button id="lappdNext" style="background:#888;color:#fff;border:none;border-radius:3px;padding:2px 8px;cursor:pointer;">&#9654;</button>
+    <span id="lappdReadoutMeta" style="color:#666;margin-left:4px;"></span>
+  </div>
+  <div style="display:flex;gap:12px;justify-content:center;">
+    <div><div style="font-size:11px;text-align:center;margin-bottom:2px;">Side 0</div><canvas id="roCanvas0" width="512" height="56" style="border:1px solid #ccc;border-radius:4px;"></canvas></div>
+    <div><div style="font-size:11px;text-align:center;margin-bottom:2px;">Side 1</div><canvas id="roCanvas1" width="512" height="56" style="border:1px solid #ccc;border-radius:4px;"></canvas></div>
   </div>
 </div>
 

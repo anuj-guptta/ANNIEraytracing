@@ -16,6 +16,9 @@ from urllib.parse import urlparse, parse_qs
 
 import numpy as np
 
+import taichi as ti
+ti.init(arch=ti.gpu, default_fp=ti.f32)
+
 from annieray.lappd_model import build_housing, housing_to_arrays, LAPPDHousing, compute_housing_track_length
 from annieray.lappd_response import process_hit_dicts, LAPPDResponseConfig
 

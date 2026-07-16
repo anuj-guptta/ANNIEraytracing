@@ -133,6 +133,24 @@ def load_all(path: Path | str) -> dict[str, pd.DataFrame]:
     return {key: load_table(path, key) for key in DTYPES}
 
 
+def load_event_lappd_readout(path: str | Path, event_id: int
+                              ) -> dict[int, np.ndarray] | None:
+    """Read LAPPD readout matrices for *event_id*.
+
+    Returns ``{detector_index: (28, 256, 2) readout}``, or ``None``
+    when *event_id* has no LAPPD readout data.
+    """
+    with h5py.File(path, "r") as f:
+        grp = f.get(f"event_{event_id}")
+        if grp is None or "lappd_readouts" not in grp:
+            return None
+        data = grp["lappd_readouts"][:]   # (n_lapds, 28, 256, 2)
+        indices = grp["lappd_readouts"].attrs.get("detector_indices")
+        if indices is None:
+            return {0: data[0]} if data.shape[0] == 1 else {}
+        return {int(indices[i]): data[i] for i in range(data.shape[0])}
+
+
 def read_attrs(path: Path | str) -> dict:
     """Read root-group attributes (e.g. tank metadata)."""
     with h5py.File(path, "r") as f:

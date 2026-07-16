@@ -129,6 +129,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Enable PMT digital model")
     batch.add_argument("--full-wf", action="store_true",
                        help="Use full waveform path for PMT response")
+    batch.add_argument("--lappd-response", action="store_true",
+                       help="Enable LAPPD digital readout pipeline")
     batch.add_argument("--no-lappd", action="store_true", help="Skip LAPPD rectangles")
     batch.add_argument("--surfboard", type=int, default=0, choices=[0, 1, 3],
                        help="Number of obscurant PVC surfboards (0, 1, or 3)")
@@ -435,6 +437,7 @@ def batch_command(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         pmt_response=args.pmt_response,
         pmt_full_wf=args.full_wf,
+        lappd_response=args.lappd_response,
         output_dir=args.output_dir,
         record_events=not args.no_record,
         seed=args.seed,
@@ -495,6 +498,8 @@ def batch_command(args: argparse.Namespace) -> None:
     if config.pmt_response:
         mode = "waveform" if config.pmt_full_wf else "fast"
         print(f"  PMT response: enabled ({mode} path)")
+    if config.lappd_response:
+        print(f"  LAPPD response: enabled (6-stage Taichi pipeline)")
 
     optics_cfg = None
     if args.max_bounces > 0:

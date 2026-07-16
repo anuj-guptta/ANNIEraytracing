@@ -163,6 +163,7 @@ class BatchAccumulator:
     _n_photon_rows: int = 0
     _n_pmt_rows: int = 0
     _n_muon_rows: int = 0
+    _n_lappd_events: int = 0
 
     @property
     def h5_path(self) -> Path:
@@ -179,12 +180,15 @@ class BatchAccumulator:
         event_id: int,
         hits: np.ndarray,
         pmt_responses: Optional[dict[int, dict]] = None,
+        lappd_responses: Optional[dict[int, dict]] = None,
         muon_params: Optional[dict] = None,
     ) -> None:
-        """Record one event's hits, PMT responses, and muon truth."""
+        """Record one event's hits, PMT responses, LAPPD readouts, muon truth."""
         n_detected = self._append_photon_hits(event_id, hits)
         if pmt_responses is not None:
             self._append_pmt_responses(event_id, pmt_responses)
+        if lappd_responses is not None:
+            self._write_lappd_readouts(event_id, lappd_responses)
         if muon_params is not None:
             self._record_muon(event_id, n_detected, **muon_params)
 
@@ -282,6 +286,31 @@ class BatchAccumulator:
     # Close
     # ------------------------------------------------------------------
 
+    def _write_lappd_readouts(
+        self, event_id: int, responses: dict[int, dict]
+    ) -> None:
+        """Store per-LAPPD readout matrices as a per-event HDF5 group.
+
+        *responses* is the dict returned by ``lappd_response.process_hits()``,
+        mapping ``detector_index`` → ``{"side0": (28,256), "side1": (28,256), ...}``.
+        """
+        if not responses:
+            return
+        f = self._ensure_file()
+        det_indices = sorted(responses.keys())
+        arrays = []
+        for idx in det_indices:
+            r = responses[idx]
+            # Stack side0/side1 → (28, 256, 2)
+            stacked = np.stack([r["side0"], r["side1"]], axis=-1)
+            arrays.append(stacked)
+        data = np.stack(arrays, axis=0)  # (n_lapds, 28, 256, 2)
+        grp = f.create_group(f"event_{event_id}")
+        ds = grp.create_dataset("lappd_readouts", data=data,
+                                compression="gzip")
+        ds.attrs["detector_indices"] = det_indices
+        self._n_lappd_events += 1
+
     def close(self) -> None:
         """Close the HDF5 file (flushes data to disk)."""
         if self._h5_file is not None:
@@ -319,6 +348,7 @@ class BatchConfig:
     # Response models
     pmt_response: bool = False
     pmt_full_wf: bool = False
+    lappd_response: bool = False
 
     # I / O
     output_dir: Path = Path("results")
@@ -460,6 +490,13 @@ def run_batch(
                     event_hits, geometry, rng=rng, full_wf=config.pmt_full_wf,
                 )
 
+            lappd_responses = None
+            if config.lappd_response:
+                from annieray.lappd_response import process_hits as process_lappd_hits
+                lappd_responses = process_lappd_hits(
+                    event_hits, rng_seed=rng.integers(0, 2**31),
+                )
+
             if config.record_events:
                 muon_params = {
                     "pos": muon_pos,
@@ -469,6 +506,7 @@ def run_batch(
                 }
                 accumulator.append_event(
                     event_id, event_hits, pmt_responses,
+                    lappd_responses=lappd_responses,
                     muon_params=muon_params,
                 )
 
@@ -500,6 +538,8 @@ def run_batch(
             if accumulator._n_muon_rows > 0:
                 paths["muon_truth"] = h5_path
                 print(f"  Wrote {h5_path} ({accumulator._n_muon_rows} muon truth rows)")
+            if accumulator._n_lappd_events > 0:
+                print(f"  LAPPD readouts stored for {accumulator._n_lappd_events} events")
             return paths
 
     return {}

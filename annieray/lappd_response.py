@@ -168,9 +168,6 @@ class LAPPDResponseConfig:
 # Taichi kernel helpers
 # ---------------------------------------------------------------------------
 
-# Initialise Taichi (required before any kernel/func definitions are parsed)
-ti.init(arch=ti.gpu, default_fp=ti.f32)
-
 # Pre-computed constants for Gaussian CDF via erf
 _SQRT2 = 1.4142135623730951
 _SQRT2PI = 2.5066282746310002
