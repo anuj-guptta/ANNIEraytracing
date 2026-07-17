@@ -57,6 +57,8 @@ python -m annieray batch [flags]
 | `--det-rotation` | 22.5 | Global Z-rotation (deg) |
 | `--z-offset` | 0.0 | Vertical offset (mm) |
 | `--no-lappd` | false | Skip LAPPD rectangles |
+| `--no-gdml` | false | Skip inner structure GDML mesh (tank + PMTs only) |
+| `--no-pmt-holders` | false | Skip PMT body and hardware holder meshes (PMT positions still loaded) |
 | `--max-bounces` | 0 | Multi-bounce optics |
 | `--pmt-response` | false | Enable PMT digital model (SPE charge + TTS) |
 | `--full-wf` | false | Full waveform path (requires `--pmt-response`) |
@@ -110,6 +112,8 @@ python -m annieray fit output.h5 [--event 0] [flags]
 | `--save-grid` | None | Save likelihood surface to NPZ |
 | `--show` | false | Show plot (auto: rectangular for zoom, polar for full-sky) |
 | `--polar` | false | Force polar projection |
+| `--no-gdml` | false | Skip inner structure GDML mesh |
+| `--no-pmt-holders` | false | Skip PMT body and hardware holder meshes |
 
 **Plot type auto-detection:**
 - Full-sky grid (θ span > 170°, φ span > 350°) → polar

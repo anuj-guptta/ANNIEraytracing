@@ -13,7 +13,7 @@ import taichi as ti
 from annieray import gdml_parser, step_parser
 from annieray import pmt_loader
 from annieray import pmt_mesh
-from annieray.optics import OpticalMaterial
+from annieray.optics import OpticalMaterial, WaterAttenuation
 from annieray.step_parser import LAPPD_HALF_SIZE
 
 
@@ -380,6 +380,8 @@ def build_geometry(
     pmt_csv_path: Optional[Path] = None,
     lappd_indices: Optional[list[int]] = None,
     no_lappd: bool = False,
+    no_gdml: bool = False,
+    no_pmt_holders: bool = False,
     z_offset: float = 0.0,
     lappd_model: str = "default",
     bottom_rotation_deg: float = 45.0,
@@ -390,26 +392,32 @@ def build_geometry(
     """Build a Geometry from a GDML file and optional PMT/STEP data sources.
 
     Stages:
-      1. Parse the GDML structure mesh (always required).
+      1. Parse the GDML structure mesh (skipped when no_gdml=True).
       2. Load PMT positions from CSV, or from STEP manifest as fallback.
       3. Load the STEP manifest (if available) for LAPPD and tank info.
       4. Build default LAPPD rectangles from manifest candidate positions.
       5. Optionally build the ANNIE LAPPD housing model.
       6. Build the detector registry (stable ID → DetectorInfo mapping).
+      7. Load PMT body/hardware meshes (skipped when no_pmt_holders=True).
     """
     # ---- Stage 1: parse the GDML structure mesh ----
-    # Prefer a pre-built .npz cache (fast, no XML parsing).
-    cache_path = gdml_path.with_suffix(".npz").with_name(
-        gdml_path.stem + "_cache.npz"
-    )
-    if cache_path.exists():
-        data = np.load(cache_path)
-        verts, tris = data["vertices"], data["triangles"]
-        print(f"  Structure mesh: {len(verts)} verts, {len(tris)} tris (cached)")
+    if no_gdml:
+        verts = np.zeros((0, 3), dtype=np.float32)
+        tris = np.zeros((0, 3), dtype=np.int32)
+        print("  Structure mesh: skipped (--no-gdml)")
     else:
-        verts, tris = gdml_parser.parse_gdml(gdml_path)
-    if det_rotation_deg != 0.0 and verts.shape[0] > 0:
-        pmt_loader.rotate_z(verts, det_rotation_deg)
+        # Prefer a pre-built .npz cache (fast, no XML parsing).
+        cache_path = gdml_path.with_suffix(".npz").with_name(
+            gdml_path.stem + "_cache.npz"
+        )
+        if cache_path.exists():
+            data = np.load(cache_path)
+            verts, tris = data["vertices"], data["triangles"]
+            print(f"  Structure mesh: {len(verts)} verts, {len(tris)} tris (cached)")
+        else:
+            verts, tris = gdml_parser.parse_gdml(gdml_path)
+        if det_rotation_deg != 0.0 and verts.shape[0] > 0:
+            pmt_loader.rotate_z(verts, det_rotation_deg)
 
     # ---- Stage 1b: build BVH for structure mesh ----
     from annieray.bvh import build_bvh
@@ -592,7 +600,7 @@ def build_geometry(
     pmt_instance_pos_arr = np.zeros((0, 3), dtype=np.float32)
     pmt_bounding_radii_arr = np.zeros(0, dtype=np.float32)
 
-    if pmt_csv_path and pmt_csv_path.exists() and len(pmt_centers) > 0:
+    if not no_pmt_holders and pmt_csv_path and pmt_csv_path.exists() and len(pmt_centers) > 0:
         body_meshes = pmt_mesh.load_pmt_body_meshes()
         pmt_body_tris, pmt_body_mat_ids, pmt_body_offsets = \
             pmt_mesh.build_body_tris_arrays(body_meshes)
@@ -1821,6 +1829,7 @@ def trace_with_optics(
     max_bounces: int = 3,
     n_water: float = N_WATER_DEFAULT,
     rng: np.random.Generator | None = None,
+    water_config: WaterAttenuation | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Trace rays with multi-bounce optical surface physics.
 
@@ -1848,6 +1857,9 @@ def trace_with_optics(
         Refractive index of water (used for Fresnel computation).
     rng:
         NumPy random generator.
+    water_config:
+        Water absorption / Rayleigh scattering parameters, or ``None``
+        to disable water attenuation (default).
 
     Returns
     -------
@@ -1860,7 +1872,7 @@ def trace_with_optics(
         lookups into per-photon data like creation time).  If no hits
         are detected, returns two empty arrays and an empty index array.
     """
-    from annieray.optics import evaluate_hit
+    from annieray.optics import evaluate_hit, rayleigh_scatter_dir
 
     if rng is None:
         rng = np.random.default_rng()
@@ -1876,16 +1888,21 @@ def trace_with_optics(
     detected_bounces: list[np.int32] = []
     detected_indices: list[int] = []
 
-    for bounce in range(max_bounces + 1):
+    use_water = water_config is not None and water_config.is_active
+    μ_total = water_config.mu_total if use_water else 0.0
+
+    # n_surface_bounces tracks physical surface reflections only.
+    # Water-scatter retraces don't count toward max_bounces.
+    n_surface = 0
+    while n_surface <= max_bounces:
         idx = np.where(alive)[0]
         if len(idx) == 0:
             break
 
         hits = trace_rays(origins[idx], directions[idx], geometry)
 
-        total_path[idx] += hits[:, HT]
-
         next_alive = np.zeros(len(idx), dtype=bool)
+        this_iter_had_surface = False
 
         for j in range(len(idx)):
             i = idx[j]
@@ -1899,6 +1916,27 @@ def trace_with_optics(
                 alive[i] = False
                 continue
 
+            seg_len = hits[j, HT]
+
+            # ---- Water attenuation (absorption / Rayleigh scatter) ----
+            if use_water and μ_total > 0:
+                u = rng.random()
+                if u < 1.0 - np.exp(-seg_len * μ_total):
+                    s = -np.log(1.0 - u) / μ_total
+                    if water_config.mu_abs > 0 and rng.random() < water_config.mu_abs / μ_total:
+                        # Absorbed
+                        alive[i] = False
+                        continue
+                    # Rayleigh scatter — not a surface bounce
+                    total_path[i] += s
+                    origins[i] = origins[i] + s * directions[i]
+                    directions[i] = rayleigh_scatter_dir(directions[i], rng)
+                    next_alive[j] = True
+                    continue
+
+            # ---- No water interaction → process surface hit ----
+            total_path[i] += seg_len
+
             incident_dir = directions[i]
             normal = hits[j, HNX:HNZ + 1]
             action, new_dir = evaluate_hit(mat_opt, incident_dir, normal, n_water, rng)
@@ -1906,16 +1944,22 @@ def trace_with_optics(
             if action == "detect":
                 hits[j, HT] = total_path[i]
                 detected_hits.append(hits[j:j + 1].copy())
-                detected_bounces.append(np.int32(bounce))
+                detected_bounces.append(np.int32(n_surface))
                 detected_indices.append(i)
                 alive[i] = False
             elif action == "reflect":
                 origins[i] = hits[j, HX:HZ + 1]
                 directions[i] = new_dir
                 next_alive[j] = True
+                this_iter_had_surface = True
             # absorb: drop
 
         alive[idx] = next_alive
+
+        if this_iter_had_surface:
+            n_surface += 1
+        elif not use_water:
+            break  # no surface interactions and no water → done
 
     if detected_hits:
         hits_out = np.concatenate(detected_hits, axis=0)
@@ -2080,6 +2124,7 @@ def trace_cherenkov(
     n_water: float = N_WATER_DEFAULT,
     max_bounces: int = 0,
     optics_config: dict[int, OpticalMaterial] | None = None,
+    water_config: WaterAttenuation | None = None,
 ) -> np.ndarray:
     """Trace Cherenkov photons from a muon track.
 
@@ -2099,6 +2144,9 @@ def trace_cherenkov(
         If provided, the track length is automatically computed
         from the tank or LAPPD housing bounds.  When ``None``,
         a fixed 4.0 m track is used.
+    water_config:
+        Water absorption / Rayleigh scattering parameters, or ``None``
+        to disable (default).
 
     Returns ``(N, N_EXPANDED_COLS)`` hit array with columns:
         0: hit_flag, 1: t (mm), 2-4: x,y,z, 5-7: nx,ny,nz,
@@ -2132,11 +2180,13 @@ def trace_cherenkov(
         full[:, H_ARRIVAL] = create_times
         return full
 
-    if max_bounces > 0:
+    use_water = water_config is not None and water_config.is_active
+    if max_bounces > 0 or use_water:
         cfg = optics_config if optics_config is not None else load_optics_config(None)
         hits, bounce_counts, orig_indices = trace_with_optics(
             origins, directions, geometry, cfg,
             max_bounces=max_bounces, n_water=n_water, rng=rng,
+            water_config=water_config,
         )
     else:
         hits = trace_rays(origins, directions, geometry)

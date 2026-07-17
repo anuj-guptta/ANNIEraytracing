@@ -58,12 +58,30 @@ python -m annieray batch \
     --pmt-csv PMTPositions_Scan.txt \
     --events 100 --photons-per-cm 150
 
+# Batch simulation without inner structure (PMTs + LAPPDs only)
+python -m annieray batch --no-gdml \
+    --pmt-csv PMTPositions_Scan.txt \
+    --events 100
+
+# Batch simulation without PMT holder meshes (faster, PMT positions still loaded)
+python -m annieray batch --no-pmt-holders \
+    --pmt-csv PMTPositions_Scan.txt \
+    --events 100
+
 # Direction fit
 python -m annieray fit output.h5 --event 0 --show
 
 # 3D viewer
 python -m annieray viz-server --pmt-csv PMTPositions_Scan.txt --port 8080
 ```
+
+### CLI Flags for Geometry Control
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--no-gdml` | false | Skip inner structure GDML mesh (tank + PMTs only) |
+| `--no-pmt-holders` | false | Skip PMT body and hardware holder meshes (PMT positions still loaded) |
+| `--no-lappd` | false | Skip LAPPD rectangles |
 
 ## Key Data Files
 

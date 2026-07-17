@@ -2570,6 +2570,8 @@ def run_server(args):
         manifest_path=manifest_path,
         pmt_csv_path=pmt_csv,
         no_lappd=args.no_lappd,
+        no_gdml=args.no_gdml,
+        no_pmt_holders=args.no_pmt_holders,
         z_offset=args.z_offset,
         lappd_model=args.lappd_model,
         bottom_rotation_deg=args.bottom_rot,

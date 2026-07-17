@@ -14,7 +14,7 @@ from annieray.tracer import (
     trace_cherenkov,
     Geometry,
 )
-from annieray.optics import load_optics_config
+from annieray.optics import WaterAttenuation, load_optics_config
 from annieray.output import write_hits, write_detector_config
 
 
@@ -39,6 +39,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--lappd-indices", type=str, default=None,
                      help="Comma-separated LAPPD candidate indices (default: use 3 from manifest)")
     run.add_argument("--no-lappd", action="store_true", help="Skip LAPPD rectangles")
+    run.add_argument("--no-gdml", action="store_true",
+                     help="Skip inner structure GDML mesh (tank + PMTs only)")
+    run.add_argument("--no-pmt-holders", action="store_true",
+                     help="Skip PMT body and hardware holder meshes (PMT positions still loaded)")
     run.add_argument("--z-offset", type=float, default=0.0,
                      help="Vertical offset (mm) — use when PMT CSV and GDML use different Z origins")
     run.add_argument("--lappd-model", choices=["default", "annie"], default="annie",
@@ -53,6 +57,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Number of surface reflections per photon (0 = off, default: 0)")
     run.add_argument("--optics-config", type=Path, default=None,
                      help="YAML file with per-material optical properties (default: built-in)")
+    run.add_argument("--water-absorption-mm", type=float, default=0.0,
+                     help="Water absorption length in mm (0 = off, default: 0)")
+    run.add_argument("--water-scattering-mm", type=float, default=0.0,
+                     help="Rayleigh scattering length in mm (0 = off, default: 0)")
 
     cherenkov = sub.add_parser("extract-manifest", help="Extract component manifest from STEP")
     cherenkov.add_argument("--step", required=True, type=Path, help="Path to STEP CAD file")
@@ -67,6 +75,10 @@ def build_parser() -> argparse.ArgumentParser:
     viz.add_argument("--host", type=str, default="localhost", help="Host to bind (default: localhost)")
     viz.add_argument("--port", type=int, default=8080, help="Port to bind (default: 8080)")
     viz.add_argument("--no-lappd", action="store_true", help="Skip LAPPD rectangles")
+    viz.add_argument("--no-gdml", action="store_true",
+                     help="Skip inner structure GDML mesh (tank + PMTs only)")
+    viz.add_argument("--no-pmt-holders", action="store_true",
+                     help="Skip PMT body and hardware holder meshes (PMT positions still loaded)")
     viz.add_argument("--z-offset", type=float, default=0.0, help="Vertical offset (mm)")
     viz.add_argument("--lappd-model", choices=["default", "annie"], default="annie",
                      help="LAPPD geometry model (default: bare rectangle; annie: housed LAPPD)")
@@ -89,6 +101,10 @@ def build_parser() -> argparse.ArgumentParser:
     detcfg.add_argument("--output", "-o", type=Path, default=Path("detectors.yaml"),
                         help="Output YAML path (default: detectors.yaml)")
     detcfg.add_argument("--no-lappd", action="store_true", help="Skip LAPPD rectangles")
+    detcfg.add_argument("--no-gdml", action="store_true",
+                        help="Skip inner structure GDML mesh (tank + PMTs only)")
+    detcfg.add_argument("--no-pmt-holders", action="store_true",
+                        help="Skip PMT body and hardware holder meshes (PMT positions still loaded)")
     detcfg.add_argument("--z-offset", type=float, default=0.0, help="Vertical offset (mm)")
     detcfg.add_argument("--lappd-model", choices=["default", "annie"], default="default",
                         help="LAPPD geometry model")
@@ -132,6 +148,10 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--lappd-response", action="store_true",
                        help="Enable LAPPD digital readout pipeline")
     batch.add_argument("--no-lappd", action="store_true", help="Skip LAPPD rectangles")
+    batch.add_argument("--no-gdml", action="store_true",
+                       help="Skip inner structure GDML mesh (tank + PMTs only)")
+    batch.add_argument("--no-pmt-holders", action="store_true",
+                       help="Skip PMT body and hardware holder meshes (PMT positions still loaded)")
     batch.add_argument("--surfboard", type=int, default=0, choices=[0, 1, 3],
                        help="Number of obscurant PVC surfboards (0, 1, or 3)")
     batch.add_argument("--z-offset", type=float, default=0.0, help="Vertical offset (mm)")
@@ -144,9 +164,13 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--wavelength", type=float, default=350.0,
                        help="Photon wavelength in nm (default: 350)")
     batch.add_argument("--max-bounces", type=int, default=0,
-                       help="Number of surface reflections per photon (0 = off)")
+                        help="Number of surface reflections per photon (0 = off)")
     batch.add_argument("--optics-config", type=Path, default=None,
-                       help="YAML file with per-material optical properties")
+                        help="YAML file with per-material optical properties")
+    batch.add_argument("--water-absorption-mm", type=float, default=0.0,
+                        help="Water absorption length in mm (0 = off, default: 0)")
+    batch.add_argument("--water-scattering-mm", type=float, default=0.0,
+                        help="Rayleigh scattering length in mm (0 = off, default: 0)")
     batch.add_argument("--seed", type=int, default=None, help="Random seed")
     batch.add_argument("--light-burst", action="store_true",
                        help="Isotropic light burst (instead of muon Cherenkov)")
@@ -166,6 +190,10 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--step", type=Path, default=None, help="Path to STEP CAD file")
     fit.add_argument("--manifest", type=Path, default=None, help="Path to cached component manifest JSON")
     fit.add_argument("--no-lappd", action="store_true", help="Skip LAPPD rectangles")
+    fit.add_argument("--no-gdml", action="store_true",
+                     help="Skip inner structure GDML mesh (tank + PMTs only)")
+    fit.add_argument("--no-pmt-holders", action="store_true",
+                     help="Skip PMT body and hardware holder meshes (PMT positions still loaded)")
     fit.add_argument("--z-offset", type=float, default=0.0, help="Vertical offset (mm)")
     fit.add_argument("--lappd-model", choices=["default", "annie"], default="annie",
                      help="LAPPD geometry model")
@@ -298,7 +326,8 @@ def run_command(args: argparse.Namespace) -> None:
     print(f"Loading geometry from {args.gdml}...")
     geom = build_geometry(args.gdml, step_path=args.step, manifest_path=args.manifest,
                           pmt_csv_path=args.pmt_csv, lappd_indices=lappd_indices,
-                          no_lappd=args.no_lappd, z_offset=args.z_offset, lappd_model=args.lappd_model,
+                          no_lappd=args.no_lappd, no_gdml=args.no_gdml, no_pmt_holders=args.no_pmt_holders,
+                          z_offset=args.z_offset, lappd_model=args.lappd_model,
                           det_rotation_deg=args.det_rotation, n_surfboards=args.surfboard)
 
     print(f"  Mesh: {geom.mesh_vertices.shape[0]} vertices, {geom.mesh_triangles.shape[0]} triangles")
@@ -317,8 +346,23 @@ def run_command(args: argparse.Namespace) -> None:
 
     rng = np.random.default_rng(args.seed)
 
-    if args.max_bounces > 0 and args.mode == "cherenkov":
-        print(f"\nMulti-bounce optics enabled: max {args.max_bounces} reflections per photon")
+    water_cfg = WaterAttenuation(
+        absorption_length_mm=args.water_absorption_mm,
+        scattering_length_mm=args.water_scattering_mm,
+    )
+    needs_optics = args.max_bounces > 0 or water_cfg.is_active
+    if needs_optics and args.mode == "cherenkov":
+        what = []
+        if args.max_bounces > 0:
+            what.append(f"max {args.max_bounces} reflections")
+        if water_cfg.is_active:
+            parts = []
+            if water_cfg.absorption_length_mm > 0:
+                parts.append(f"absorption={water_cfg.absorption_length_mm:.0f} mm")
+            if water_cfg.scattering_length_mm > 0:
+                parts.append(f"scattering={water_cfg.scattering_length_mm:.0f} mm")
+            what.append("water " + ", ".join(parts))
+        print(f"\nMulti-bounce optics enabled: {'; '.join(what)} per photon")
 
     total_photons = args.photons_per_cm * 401
     print(f"\nGenerating {args.photons_per_cm} photons/cm × 401 steps = {total_photons} total ({args.mode} mode)...")
@@ -327,13 +371,14 @@ def run_command(args: argparse.Namespace) -> None:
         origins, directions = _generate_uniform(geom, total_photons, rng)
         hits = trace_rays(origins, directions, geom)
     else:
-        optics_cfg = load_optics_config(args.optics_config) if args.max_bounces > 0 else None
+        optics_cfg = load_optics_config(args.optics_config) if needs_optics else None
         hits = trace_cherenkov(
             (0.0, 0.0, 2000.0), (0.0, 0.0, -1.0),
             args.photons_per_cm, geom, rng=rng,
             wavelength_nm=args.wavelength,
             max_bounces=args.max_bounces,
             optics_config=optics_cfg,
+            water_config=water_cfg if water_cfg.is_active else None,
         )
     t_gen = time.time() - t0
     print(f"  Generated/traced in {t_gen:.2f}s")
@@ -361,6 +406,7 @@ def build_detector_config_command(args: argparse.Namespace) -> None:
     print(f"Loading geometry from {args.gdml}...")
     geom = build_geometry(args.gdml, step_path=args.step, manifest_path=args.manifest,
                           pmt_csv_path=args.pmt_csv, no_lappd=args.no_lappd,
+                          no_gdml=args.no_gdml, no_pmt_holders=args.no_pmt_holders,
                           z_offset=args.z_offset, lappd_model=args.lappd_model,
                           det_rotation_deg=args.det_rotation)
 
@@ -444,6 +490,8 @@ def batch_command(args: argparse.Namespace) -> None:
         light_burst=args.light_burst,
         burst_n_photons=args.burst_n_phots,
         burst_position=burst_position,
+        water_absorption_mm=args.water_absorption_mm,
+        water_scattering_mm=args.water_scattering_mm,
     )
 
     # Validate
@@ -463,7 +511,8 @@ def batch_command(args: argparse.Namespace) -> None:
     print(f"Loading geometry from {args.gdml}...")
     geom = build_geometry(args.gdml, step_path=args.step, manifest_path=args.manifest,
                           pmt_csv_path=args.pmt_csv, lappd_indices=lappd_indices,
-                          no_lappd=args.no_lappd, z_offset=args.z_offset,
+                          no_lappd=args.no_lappd, no_gdml=args.no_gdml, no_pmt_holders=args.no_pmt_holders,
+                          z_offset=args.z_offset,
                           lappd_model=args.lappd_model,
                           det_rotation_deg=args.det_rotation, n_surfboards=args.surfboard)
 
@@ -501,11 +550,25 @@ def batch_command(args: argparse.Namespace) -> None:
     if config.lappd_response:
         print(f"  LAPPD response: enabled (6-stage Taichi pipeline)")
 
+    water_cfg = WaterAttenuation(
+        absorption_length_mm=args.water_absorption_mm,
+        scattering_length_mm=args.water_scattering_mm,
+    )
+    needs_optics = args.max_bounces > 0 or water_cfg.is_active
     optics_cfg = None
-    if args.max_bounces > 0:
-        from annieray.optics import load_optics_config
+    if needs_optics:
         optics_cfg = load_optics_config(args.optics_config)
-        print(f"  Multi-bounce optics: max {args.max_bounces} reflections")
+        what = []
+        if args.max_bounces > 0:
+            what.append(f"max {args.max_bounces} reflections")
+        if water_cfg.is_active:
+            parts = []
+            if water_cfg.absorption_length_mm > 0:
+                parts.append(f"absorption={water_cfg.absorption_length_mm:.0f} mm")
+            if water_cfg.scattering_length_mm > 0:
+                parts.append(f"scattering={water_cfg.scattering_length_mm:.0f} mm")
+            what.append("water " + ", ".join(parts))
+        print(f"  Multi-bounce optics: {'; '.join(what)} per photon")
 
     paths = run_batch(geom, config, optics_config=optics_cfg)
 
@@ -554,6 +617,8 @@ def fit_command(args: argparse.Namespace) -> None:
         manifest_path=args.manifest,
         pmt_csv_path=pmt_csv,
         no_lappd=args.no_lappd,
+        no_gdml=args.no_gdml,
+        no_pmt_holders=args.no_pmt_holders,
         z_offset=args.z_offset,
         lappd_model=args.lappd_model,
         det_rotation_deg=args.det_rotation,
