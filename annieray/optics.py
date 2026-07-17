@@ -203,6 +203,83 @@ def cosine_weighted_hemisphere(normal: np.ndarray, rng: np.random.Generator) -> 
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Water attenuation (absorption + Rayleigh scattering)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WaterAttenuation:
+    """Water absorption and Rayleigh scattering parameters.
+
+    Both lengths are in mm.  A value of 0 (or less) disables the
+    corresponding process.
+    """
+    absorption_length_mm: float = 0.0
+    scattering_length_mm: float = 0.0
+
+    @property
+    def is_active(self) -> bool:
+        return self.absorption_length_mm > 0 or self.scattering_length_mm > 0
+
+    @property
+    def mu_abs(self) -> float:
+        return 1.0 / self.absorption_length_mm if self.absorption_length_mm > 0 else 0.0
+
+    @property
+    def mu_scat(self) -> float:
+        return 1.0 / self.scattering_length_mm if self.scattering_length_mm > 0 else 0.0
+
+    @property
+    def mu_total(self) -> float:
+        return self.mu_abs + self.mu_scat
+
+
+def rayleigh_scatter_dir(incident_dir: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Sample a Rayleigh-scattered direction for unpolarised light in pure water.
+
+    The scattering-angle PDF is proportional to ``1 + cos²θ`` (the
+    unpolarised Rayleigh phase function).  The azimuthal angle φ is
+    uniform in ``[0, 2π)``.  Uses rejection sampling (~67 % efficiency).
+
+    Parameters
+    ----------
+    incident_dir:
+        ``(3,)`` float32 unit vector — incoming direction.
+    rng:
+        NumPy random generator.
+
+    Returns
+    -------
+    ``(3,)`` float32 unit vector — scattered direction.
+    """
+    while True:
+        cos_theta = rng.uniform(-1.0, 1.0)
+        if rng.random() < (1.0 + cos_theta * cos_theta) / 2.0:
+            break
+    sin_theta = np.sqrt(max(0.0, 1.0 - cos_theta * cos_theta))
+    phi = rng.uniform(0.0, 2.0 * np.pi)
+
+    w = incident_dir
+    up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    if abs(w[2]) > 0.99:
+        up = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    u = np.cross(w, up)
+    u_norm = np.linalg.norm(u)
+    if u_norm < 1e-12:
+        u = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    else:
+        u /= u_norm
+    v = np.cross(w, u)
+
+    return sin_theta * np.cos(phi) * u + sin_theta * np.sin(phi) * v + cos_theta * w
+
+
+# ---------------------------------------------------------------------------
+# Hit evaluator
+# ---------------------------------------------------------------------------
+
+
 def evaluate_hit(
     mat_opt: OpticalMaterial,
     incident_dir: np.ndarray,

@@ -28,6 +28,7 @@ from annieray.tracer import (
     C_MM_NS, N_WATER_DEFAULT,
     trace_rays, trace_cherenkov, compute_track_length, Geometry,
 )
+from annieray.optics import WaterAttenuation
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +355,10 @@ class BatchConfig:
     output_dir: Path = Path("results")
     record_events: bool = True
 
+    # Water attenuation
+    water_absorption_mm: float = 0.0
+    water_scattering_mm: float = 0.0
+
     # Reproducibility
     seed: Optional[int] = None
 
@@ -446,13 +451,18 @@ def run_batch(
         all_ctimes = np.concatenate(batch_ctimes)
 
         # --- One GPU launch for the whole batch ---
-        if config.max_bounces > 0:
+        water_cfg = WaterAttenuation(
+            absorption_length_mm=config.water_absorption_mm,
+            scattering_length_mm=config.water_scattering_mm,
+        )
+        if config.max_bounces > 0 or water_cfg.is_active:
             from annieray.tracer import trace_with_optics
             from annieray.optics import load_optics_config
             cfg = optics_config if optics_config is not None else load_optics_config(None)
             hits, bounce_counts, orig_indices = trace_with_optics(
                 all_origins, all_dirs, geometry, cfg,
                 max_bounces=config.max_bounces, n_water=n_water, rng=rng,
+                water_config=water_cfg if water_cfg.is_active else None,
             )
         else:
             hits = trace_rays(all_origins, all_dirs, geometry)
