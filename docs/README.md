@@ -5,9 +5,11 @@ Traces photons through a GDML-detailed inner structure, PMTs, LAPPDs, and
 obscurant surfboard panels, recording hit positions, local coordinates,
 arrival times, and wavelengths.
 
-Includes a **direction-fitting framework** with on-the-fly raytracing:
-Poisson charge likelihood + Gaussian time residual likelihood with grid
-scanning.
+Includes a **gridded likelihood-search framework**: batch events on the
+GPU, then scan a grid of muon hypotheses (direction, and optionally
+vertex position) and score each against the observed event using a
+Poisson charge likelihood + optional Gaussian time residual likelihood,
+with on-the-fly raytracing per hypothesis.
 
 ## Quick Start
 
@@ -69,6 +71,8 @@ python -m annieray batch [flags]
 | `--no-record` | false | Skip writing per-event output |
 | `--wavelength` | 350.0 | Cherenkov photon wavelength (nm) |
 | `--optics-config` | None | YAML file with per-material optical properties |
+| `--water-absorption-mm` | 0.0 | Water absorption length in mm (0 = off) |
+| `--water-scattering-mm` | 0.0 | Rayleigh scattering length in mm (0 = off) |
 | `--seed` | None | Random seed |
 
 **Output** — A single `output.h5` containing tables:
@@ -118,6 +122,49 @@ python -m annieray fit output.h5 [--event 0] [flags]
 **Plot type auto-detection:**
 - Full-sky grid (θ span > 170°, φ span > 350°) → polar
 - Zoomed-in grid → rectangular (Δθ × Δφ heatmap)
+
+### Gridded likelihood search workflow
+
+The fitting framework searches over muon hypotheses and scores each one
+against the observed data. Two dimensions can be scanned independently:
+
+**Direction scan** (`fit`): fix the vertex position, scan θ × φ. The
+likelihood surface is an `(n_θ, n_φ)` array of log-likelihoods
+(`ScanResult.scores`).
+
+**Position scan** (`scripts/scan_ll_vs_position*.py`): fix the direction,
+scan (x, z) or (x, y) vertex positions. A fast full-sky direction fit can
+be run at *each* position (`scan_ll_vs_position.py`), or a single fixed
+direction traced once per position (`scan_ll_vs_position_fixed_dir.py`,
+~0.5 s/position).
+
+Typical end-to-end workflow:
+
+```bash
+# 1. Simulate events
+python -m annieray batch --pmt-csv PMTPositions_Scan.txt \
+    --events 100 --photons-per-cm 150 --pmt-response
+
+# 2. Coarse full-sky direction fit for one event
+python -m annieray fit results/output.h5 --event 0 --show
+
+# 3. Zoom in around the best direction for precision
+python -m annieray fit results/output.h5 --event 0 \
+    --theta-window 10 --phi-window 10 --grid-steps 41 \
+    --save-grid grid.npz --show
+
+# 4. Sweep the vertex position with a fixed direction (fast)
+python scripts/scan_ll_vs_position_fixed_dir.py results/output.h5 \
+    --grid-x "-1200 1200 13" --grid-z "300 2700 13" --show
+
+# 5. Replot a saved likelihood surface
+python scripts/fit_viewer.py grid.npz --clip 10 --polar
+```
+
+The search reuses a single pre-built `Geometry` and calls
+`trace_cherenkov()` once per hypothesis in `annieray/fitting.py`.
+The truth direction from `muon_truth` is stored in the `ScanResult` so
+that fit residuals can be computed for validation.
 
 ### Other commands
 
@@ -186,6 +233,49 @@ python scripts/scan_ll_vs_position_fixed_dir.py output.h5 \
 | `--clip` | auto | Colormap range (5th–95th percentile by default) |
 | `--save` | None | Save results to NPZ |
 | `--show` | false | Show heatmap |
+
+### `generate_muon_grid.py`
+
+Generate a `MuonStartsAndDirecs`-format file with a configurable angular
+scan: for each (x,z) position in the standard 13×13 grid, creates n×n
+muon directions evenly spaced from −half_range to +half_range in both the
+vertical and horizontal planes. With `--n-steps 1` the direction is
+always (0, 1, 0).
+
+```bash
+python scripts/generate_muon_grid.py > MuonStartsAndDirecs_angled.txt
+python scripts/generate_muon_grid.py --n-steps 5 --half-range 45 > MuonStartsAndDirecs_5x5.txt
+python scripts/generate_muon_grid.py --n-steps 1 > MuonStartsAndDirecs_1x1.txt
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--n-steps` | 3 | Number of angle steps per axis |
+| `--half-range` | 22.5 | Half-range of angles in degrees |
+
+The output feeds `annieray batch --muon-file MuonStartsAndDirecs_angled.txt`.
+
+### `event_display.py`
+
+Interactive three-panel event display for batch output: top endcap PMTs,
+unrolled barrel (φ vs Z, φ centered on the median LAPPD so surfboard-
+mounted LAPPDs appear mid-plot), and bottom endcap PMTs. Navigate events
+with ◀/▶ buttons or arrow keys.
+
+```bash
+python scripts/event_display.py results/
+python scripts/event_display.py results/output.h5
+```
+
+### `load_batch.py`
+
+Template script showing how to load HDF5 output and group hits by event
+and detector: per-event hit counts, per-detector aggregates, muon truth
+joins, and PMT response summaries.
+
+```bash
+python scripts/load_batch.py results/output.h5
+```
 
 ## Likelihood model
 
@@ -279,10 +369,16 @@ The `--lappd-model annie` flag replaces the default bare photocathode
 rectangle with the full Kandemir waterproof housing: a 5-sided acrylic
 box (330 x 430 x 60 mm) with an off-centre photocathode (191.5 x 191.5 mm).
 
-## Multi-bounce optics
+## Multi-bounce optics & water attenuation
 
 With `--max-bounces N` (N > 0), `trace_with_optics()` manages N rounds
 of Fresnel reflection/transmission and diffuse reflection per material.
+
+Water attenuation is enabled with `--water-absorption-mm` and
+`--water-scattering-mm` (via the `WaterAttenuation` config in
+`annieray/optics.py`). When either is active, `trace_with_optics()`
+applies exponential absorption and Rayleigh scattering along the photon
+path. Both are off by default (`0.0` = disabled).
 
 ## Code Map
 
@@ -314,4 +410,8 @@ of Fresnel reflection/transmission and diffuse reflection per material.
 | `scripts/scan_ll_vs_position_fixed_dir.py` | Fixed-direction scan over (x,z) or (x,y) |
 | `scripts/convert_to_h5.py` | Convert old parquet output directories to HDF5 |
 | `scripts/LAPPD_positionscan.py` | LAPPD hit heatmap from batch output |
+| `scripts/LAPPD_positionscanH5.py` | LAPPD hit heatmap from HDF5 batch output |
 | `scripts/pmt_histograms.py` | Per-PMT charge/time histograms |
+| `scripts/event_display.py` | Interactive 3-panel event display |
+| `scripts/generate_muon_grid.py` | Generate `MuonStartsAndDirecs` with angular scan |
+| `scripts/load_batch.py` | Template for loading and grouping HDF5 output |
