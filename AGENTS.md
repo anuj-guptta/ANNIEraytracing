@@ -56,23 +56,26 @@ pytest
 # Batch simulation
 python -m annieray batch \
     --pmt-csv PMTPositions_Scan.txt \
+    --surfboard 3 \
     --events 100 --photons-per-cm 150
 
 # Batch simulation without inner structure (PMTs + LAPPDs only)
 python -m annieray batch --no-gdml \
     --pmt-csv PMTPositions_Scan.txt \
+    --surfboard 3 \
     --events 100
 
 # Batch simulation without PMT holder meshes (faster, PMT positions still loaded)
 python -m annieray batch --no-pmt-holders \
     --pmt-csv PMTPositions_Scan.txt \
+    --surfboard 3 \
     --events 100
 
 # Direction fit
 python -m annieray fit output.h5 --event 0 --show
 
 # 3D viewer
-python -m annieray viz-server --pmt-csv PMTPositions_Scan.txt --port 8080
+python -m annieray viz-server --pmt-csv PMTPositions_Scan.txt --surfboard 3 --port 8080
 ```
 
 ### CLI Flags for Geometry Control
@@ -82,6 +85,7 @@ python -m annieray viz-server --pmt-csv PMTPositions_Scan.txt --port 8080
 | `--no-gdml` | false | Skip inner structure GDML mesh (tank + PMTs only) |
 | `--no-pmt-holders` | false | Skip PMT body and hardware holder meshes (PMT positions still loaded) |
 | `--no-lappd` | false | Skip LAPPD rectangles |
+| `--surfboard` | 0 | Number of obscurant PVC surfboards (0, 1, or 3) — use 3 for Phase II |
 
 ## Key Data Files
 

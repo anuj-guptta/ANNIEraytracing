@@ -1971,6 +1971,37 @@ def trace_with_optics(
             np.zeros(0, dtype=np.int32))
 
 
+def build_single_lappd_geometry(
+    cad_centre: tuple[float, float, float],
+    cad_normal: tuple[float, float, float],
+    z_axis: tuple[float, float, float] = (0.0, 0.0, 1.0),
+) -> Geometry:
+    """Build a minimal Geometry containing a single ANNIE LAPPD housing.
+
+    Useful for single-LAPPD visualisation, batch mode, or any context
+    where only one housing is needed without the full detector geometry.
+    """
+    from annieray.lappd_model import build_housing, housing_to_arrays
+
+    housing = build_housing(cad_centre, cad_normal, z_axis)
+    hd, ad = housing_to_arrays(housing)
+
+    return Geometry(
+        mesh_vertices=np.zeros((0, 3), dtype=np.float32),
+        mesh_triangles=np.zeros((0, 3), dtype=np.int32),
+        pmt_centers=np.zeros((0, 3), dtype=np.float32),
+        pmt_radii=np.zeros(0, dtype=np.float32),
+        pmt_directions=np.zeros((0, 3), dtype=np.float32),
+        lappd_data=np.zeros((0, 7), dtype=np.float32),
+        lappd_strip_axes=np.zeros((0, 3), dtype=np.float32),
+        tank_radius=0.0,
+        tank_z_min=0.0,
+        tank_z_max=0.0,
+        lappd_housing_data=hd,
+        annie_lappd_data=ad,
+    )
+
+
 def _housing_from_array(arr: np.ndarray):
     """Convert a (16,) housing array back into a LAPPDHousing dataclass."""
     from annieray.lappd_model import LAPPDHousing

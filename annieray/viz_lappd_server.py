@@ -16,126 +16,60 @@ from urllib.parse import urlparse, parse_qs
 
 import numpy as np
 
-import taichi as ti
-ti.init(arch=ti.gpu, default_fp=ti.f32)
-
-from annieray.lappd_model import build_housing, housing_to_arrays, LAPPDHousing, compute_housing_track_length
+from annieray.tracer import (
+    build_single_lappd_geometry, trace_rays,
+    compute_track_length,
+    CID_LAPPD, CID_PMT, CID_INNER_STRUCTURE,
+    HI, HCID, HT, HX, HY, HZ, HNX, HNY, HNZ,
+)
+from annieray.lappd_model import build_housing, housing_to_arrays
+from annieray.cherenkov import generate_cherenkov_photons
 from annieray.lappd_response import process_hit_dicts, LAPPDResponseConfig
 
 housing_json: dict = {}
 _last_trace: dict = {}
+_geometry = None  # Geometry instance, built once at startup
 
 
-# ---------------------------------------------------------------------------
-# Analytic geometry intersection helpers  (Python, no Taichi)
-# ---------------------------------------------------------------------------
-
-# Suppress the noisy module-level print in cherenkov.py on import
-import io, sys as _sys
-_sys_modules_import = __import__
-_old_stdout = _sys.stdout
-_sys.stdout = io.StringIO()
-from annieray.cherenkov import generate_cherenkov_photons
-_sys.stdout = _old_stdout
-
-
-def _ray_box_intersect(
-    ox: float, oy: float, oz: float,
-    dx: float, dy: float, dz: float,
-    cx: float, cy: float, cz: float,
-    ax_x: float, ax_y: float, ax_z: float,
-    ay_x: float, ay_y: float, ay_z: float,
-    az_x: float, az_y: float, az_z: float,
-    hx: float, hy: float, hz: float,
-) -> tuple[bool, float, float, bool]:
-    """Slab-test ray vs oriented box.  Returns (hit, t_entry, t_exit, is_front_face).
-
-    ``t_entry`` / ``t_exit`` define the segment the ray spends inside the box.
-    ``is_front_face`` is True when the ray enters through the +Z face (the
-    acrylic window facing into the tank).
-    """
-    t_min = -1e30
-    t_max = 1e30
-    front_val = -1e30
-
-    axes = [
-        (ax_x, ax_y, ax_z, hx),
-        (ay_x, ay_y, ay_z, hy),
-        (az_x, az_y, az_z, hz),
-    ]
-    for axis_idx, (aax, aay, aaz, h) in enumerate(axes):
-        denom = dx * aax + dy * aay + dz * aaz
-        oc = (ox - cx) * aax + (oy - cy) * aay + (oz - cz) * aaz
-        t0 = (-h - oc) / denom if abs(denom) > 1e-30 else (-1e30 if (-h - oc) < 0 else 1e30)
-        t1 = (h - oc) / denom if abs(denom) > 1e-30 else (1e30 if (h - oc) > 0 else -1e30)
-        if t0 > t1:
-            t0, t1 = t1, t0
-        if t0 > t_min:
-            t_min = t0
-            if axis_idx == 2:
-                front_val = -denom
-        if t1 < t_max:
-            t_max = t1
-        if t_min > t_max:
-            return False, 0.0, 0.0, False
-
-    is_front = front_val > 0
-    return True, t_min, t_max, is_front
-
-
-def _ray_rectangle_intersect(
-    ox: float, oy: float, oz: float,
-    dx: float, dy: float, dz: float,
-    pcx: float, pcy: float, pcz: float,
-    nrmx: float, nrmy: float, nrmz: float,
-    half: float,
-    up_x: float, up_y: float, up_z: float,
-) -> tuple[bool, float, float, float, float]:
-    """Ray vs axis-aligned (in local frame) square.
-
-    ``up`` defines the local vertical (Y) direction of the rectangle;
-    the local X is ``cross(up, normal)``.
-    Returns (hit, t, nx, ny, nz).
-    """
-    denom = dx * nrmx + dy * nrmy + dz * nrmz
-    if abs(denom) < 1e-30:
-        return False, 0.0, 0.0, 0.0, 0.0
-
-    ocx = pcx - ox
-    ocy = pcy - oy
-    ocz = pcz - oz
-    t = (ocx * nrmx + ocy * nrmy + ocz * nrmz) / denom
-    if t < 1e-6:
-        return False, 0.0, 0.0, 0.0, 0.0
-
-    px = ox + dx * t
-    py = oy + dy * t
-    pz = oz + dz * t
-
-    # Local coordinates
-    # local_x = cross(up, normal)
-    lxx = up_y * nrmz - up_z * nrmy
-    lxy = up_z * nrmx - up_x * nrmz
-    lxz = up_x * nrmy - up_y * nrmx
-    ll = math.sqrt(lxx * lxx + lxy * lxy + lxz * lxz)
-    if ll > 1e-12:
-        lxx /= ll
-        lxy /= ll
-        lxz /= ll
-
-    # local_y = up (already unit)
-    lyx, lyy, lyz = up_x, up_y, up_z
-
-    u = (px - pcx) * lxx + (py - pcy) * lxy + (pz - pcz) * lxz
-    v = (px - pcx) * lyx + (py - pcy) * lyy + (pz - pcz) * lyz
-
-    if abs(u) > half or abs(v) > half:
-        return False, 0.0, 0.0, 0.0, 0.0
-
-    nx = -nrmx if denom > 0 else nrmx
-    ny = -nrmy if denom > 0 else nrmy
-    nz = -nrmz if denom > 0 else nrmz
-    return True, t, nx, ny, nz
+def _hits_array_to_dicts(
+    hits: np.ndarray,
+    origins: np.ndarray | None = None,
+    directions: np.ndarray | None = None,
+    create_times: np.ndarray | None = None,
+) -> list[dict]:
+    """Convert the (N, 14+) hit array from trace_rays into frontend dicts."""
+    _c_water = 299.792458 / 1.34  # mm/ns in water
+    result = []
+    for i in range(hits.shape[0]):
+        if hits[i, HI] < 0.5:
+            continue
+        cid = int(hits[i, HCID])
+        if cid == CID_LAPPD:
+            htype = "photocathode"
+        elif cid == CID_PMT:
+            htype = "pmt"
+        elif cid == CID_INNER_STRUCTURE:
+            htype = "housing"
+        else:
+            htype = "unknown"
+        d = {
+            "type": htype,
+            "x": float(hits[i, HX]),
+            "y": float(hits[i, HY]),
+            "z": float(hits[i, HZ]),
+            "nx": float(hits[i, HNX]),
+            "ny": float(hits[i, HNY]),
+            "nz": float(hits[i, HNZ]),
+            "t": float(hits[i, HT]),
+        }
+        if origins is not None:
+            d["origin"] = [float(origins[i, 0]), float(origins[i, 1]), float(origins[i, 2])]
+        if directions is not None:
+            d["dir"] = [float(directions[i, 0]), float(directions[i, 1]), float(directions[i, 2])]
+        if create_times is not None:
+            d["arrival_time"] = float(create_times[i]) + d["t"] / _c_water
+        result.append(d)
+    return result
 
 
 def _trace_cherenkov_on_lappd(
@@ -145,22 +79,39 @@ def _trace_cherenkov_on_lappd(
     housing: dict,
     rng: np.random.Generator,
 ) -> dict:
-    """Generate Cherenkov photons using the proper generator and trace against the LAPPD housing."""
-    # Build a LAPPDHousing from the dict for track-length computation
-    h = LAPPDHousing(
-        centre=tuple(housing["center"]),
-        axes=(tuple(housing["axis_x"]), tuple(housing["axis_y"]), tuple(housing["axis_z"])),
-        half=tuple(housing["half"]),
-    )
-    track_length = compute_housing_track_length(muon_pos, muon_dir, h)
+    """Generate and trace Cherenkov photons against the single LAPPD housing."""
+    track_length = compute_track_length(muon_pos, muon_dir, _geometry)
     origins, directions, create_times = generate_cherenkov_photons(
         muon_pos, muon_dir, photons_per_cm, track_length=track_length, rng=rng,
     )
-    result = _trace_hits(origins, directions, housing, rng, create_times)
-    result["muon_pos"] = list(muon_pos)
-    result["muon_dir"] = list(muon_dir)
-    result["photons_per_cm"] = photons_per_cm
-    return result
+    n_total = origins.shape[0]
+
+    hits_array = trace_rays(origins, directions, _geometry)
+    hit_dicts = _hits_array_to_dicts(hits_array, origins, directions, create_times)
+
+    ray_sample = max(1, n_total // 500)
+    rays = []
+    for i in range(0, n_total, ray_sample):
+        if hits_array[i, HI] > 0.5:
+            continue
+        rays.append({
+            "origin": [float(origins[i, 0]), float(origins[i, 1]), float(origins[i, 2])],
+            "dir": [float(directions[i, 0]), float(directions[i, 1]), float(directions[i, 2])],
+        })
+    ray_cap = min(len(rays), 500)
+    if len(rays) > ray_cap:
+        idx = rng.choice(len(rays), ray_cap, replace=False)
+        rays = [rays[i] for i in sorted(idx)]
+
+    return _sanitise({
+        "muon_pos": list(muon_pos),
+        "muon_dir": list(muon_dir),
+        "n_photons": n_total,
+        "n_hits": len(hit_dicts),
+        "hits": hit_dicts,
+        "rays": rays,
+        "photons_per_cm": photons_per_cm,
+    })
 
 
 def _trace_spot_on_lappd(
@@ -171,7 +122,7 @@ def _trace_spot_on_lappd(
     housing: dict,
     rng: np.random.Generator,
 ) -> dict:
-    """Generate a directed beam of N photons at the LAPPD and return hits."""
+    """Generate a directed beam of N photons and trace via the GPU kernel."""
     dx0, dy0, dz0 = dir
     norm = math.sqrt(dx0*dx0 + dy0*dy0 + dz0*dz0)
     if norm < 1e-12:
@@ -179,7 +130,6 @@ def _trace_spot_on_lappd(
     dx0 /= norm; dy0 /= norm; dz0 /= norm
     muon_dir = np.array([dx0, dy0, dz0], dtype=np.float64)
 
-    # Build orthogonal basis for scattering
     if abs(dx0) < 0.9:
         ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
     else:
@@ -202,99 +152,27 @@ def _trace_spot_on_lappd(
         origins[i] = pos
         directions[i] = d.astype(np.float32)
 
-    return _trace_hits(origins, directions, housing, rng)
+    hits_array = trace_rays(origins, directions, _geometry)
+    hit_dicts = _hits_array_to_dicts(hits_array, origins, directions)
 
-
-def _trace_hits(
-    origins: np.ndarray,
-    directions: np.ndarray,
-    housing: dict,
-    rng: np.random.Generator,
-    create_times: np.ndarray | None = None,
-) -> dict:
-    """Trace array of (origin, direction) pairs against the LAPPD housing."""
-    n_total = origins.shape[0]
-    _c_water = 299.792458 / 1.34  # mm/ns in water
-    h = housing
-    cx, cy, cz = h["center"]
-    ax0, ax1, ax2 = h["axis_x"]
-    ay0, ay1, ay2 = h["axis_y"]
-    az0, az1, az2 = h["axis_z"]
-    hhx, hhy, hhz = h["half"]
-    pcx, pcy, pcz = h["pc_center"]
-    pcnx, pcny, pcnz = h["pc_normal"]
-    pchalf = h["pc_half"][0]
-    up_x, up_y, up_z = h["axis_y"]
-
-    rays: list[dict] = []
-    hits: list[dict] = []
-    ray_sample = max(1, n_total // 500)
-
-    for i in range(n_total):
-        px, py, pz = origins[i]
-        dx, dy, dz = directions[i]
-
-        best_hit: dict | None = None
-
-        b_hit, b_entry, b_exit, b_front = _ray_box_intersect(
-            px, py, pz, dx, dy, dz, cx, cy, cz,
-            ax0, ax1, ax2, ay0, ay1, ay2, az0, az1, az2, hhx, hhy, hhz,
-        )
-
-        if b_hit:
-            origin_inside = b_entry < 1e-6
-
-            if origin_inside:
-                # ── Ray originates inside the housing box ──
-                pc_hit, pc_t, nx, ny, nz = _ray_rectangle_intersect(
-                    px, py, pz, dx, dy, dz, pcx, pcy, pcz, pcnx, pcny, pcnz, pchalf, up_x, up_y, up_z,
-                )
-                if pc_hit and pc_t > 1e-6:
-                    best_hit = {"type": "photocathode", "x": px + dx * pc_t, "y": py + dy * pc_t, "z": pz + dz * pc_t, "nx": nx, "ny": ny, "nz": nz, "t": float(pc_t)}
-
-            elif b_front and b_entry > 1e-6:
-                # ── Entered through the front face (acrylic window) ──
-                pc_hit, pc_t, nx, ny, nz = _ray_rectangle_intersect(
-                    px, py, pz, dx, dy, dz, pcx, pcy, pcz, pcnx, pcny, pcnz, pchalf, up_x, up_y, up_z,
-                )
-                if pc_hit and pc_t > 1e-6 and pc_t <= b_exit + 1e-6:
-                    best_hit = {"type": "photocathode", "x": px + dx * pc_t, "y": py + dy * pc_t, "z": pz + dz * pc_t, "nx": nx, "ny": ny, "nz": nz, "t": float(pc_t)}
-                else:
-                    # Hit the window but missed the PC → module surface hit
-                    best_hit = {"type": "housing", "x": px + dx * b_entry, "y": py + dy * b_entry, "z": pz + dz * b_entry, "nx": az0, "ny": az1, "nz": az2, "t": float(b_entry)}
-
-            else:
-                # ── Entered through side or back face (charcoal PVC) ──
-                best_hit = {"type": "housing", "x": px + dx * b_entry, "y": py + dy * b_entry, "z": pz + dz * b_entry, "nx": az0, "ny": az1, "nz": az2, "t": float(b_entry)}
-
-        else:
-            # No box intersection at all — check PC directly
-            pc_hit, pc_t, nx, ny, nz = _ray_rectangle_intersect(
-                px, py, pz, dx, dy, dz, pcx, pcy, pcz, pcnx, pcny, pcnz, pchalf, up_x, up_y, up_z,
-            )
-            if pc_hit and pc_t > 1e-6:
-                best_hit = {"type": "photocathode", "x": px + dx * pc_t, "y": py + dy * pc_t, "z": pz + dz * pc_t, "nx": nx, "ny": ny, "nz": nz, "t": float(pc_t)}
-
-        if best_hit:
-            best_hit["origin"] = [float(px), float(py), float(pz)]
-            best_hit["dir"] = [float(dx), float(dy), float(dz)]
-            if create_times is not None:
-                best_hit["arrival_time"] = float(create_times[i]) + best_hit["t"] / _c_water
-            hits.append(best_hit)
-        elif i % ray_sample == 0:
-            rays.append({"origin": [float(px), float(py), float(pz)], "dir": [float(dx), float(dy), float(dz)]})
-
+    ray_sample = max(1, n_photons // 500)
+    rays = []
+    for i in range(0, n_photons, ray_sample):
+        rays.append({
+            "origin": [float(origins[i, 0]), float(origins[i, 1]), float(origins[i, 2])],
+            "dir": [float(directions[i, 0]), float(directions[i, 1]), float(directions[i, 2])],
+        })
     ray_cap = min(len(rays), 500)
     if len(rays) > ray_cap:
         idx = rng.choice(len(rays), ray_cap, replace=False)
         rays = [rays[i] for i in sorted(idx)]
 
     return _sanitise({
-        "muon_pos": [float(o) for o in origins[0]],
-        "muon_dir": [float(d) for d in directions[0]],
-        "n_photons": n_total,
-        "n_hits": len(hits),
-        "hits": hits,
+        "muon_pos": [float(pos[0]), float(pos[1]), float(pos[2])],
+        "muon_dir": [float(dx0), float(dy0), float(dz0)],
+        "n_photons": n_photons,
+        "n_hits": len(hit_dicts),
+        "hits": hit_dicts,
         "rays": rays,
     })
 
@@ -302,48 +180,29 @@ def _trace_hits(
 def _trace_single_ray(
     ox: float, oy: float, oz: float,
     dx: float, dy: float, dz: float,
-    housing: dict,
 ) -> dict | None:
     """Trace one ray against the LAPPD.  Returns hit dict or None."""
-    h = housing
-    cx, cy, cz = h["center"]
-    ax0, ax1, ax2 = h["axis_x"]; ay0, ay1, ay2 = h["axis_y"]; az0, az1, az2 = h["axis_z"]
-    hhx, hhy, hhz = h["half"]
-    pcx, pcy, pcz = h["pc_center"]; pcnx, pcny, pcnz = h["pc_normal"]
-    pchalf = h["pc_half"][0]; up_x, up_y, up_z = h["axis_y"]
-
-    norm = math.sqrt(dx*dx + dy*dy + dz*dz)
-    if norm < 1e-12: return None
-    dx /= norm; dy /= norm; dz /= norm
-
-    best_hit = None
-
-    b_hit, b_entry, b_exit, b_front = _ray_box_intersect(ox, oy, oz, dx, dy, dz, cx, cy, cz, ax0, ax1, ax2, ay0, ay1, ay2, az0, az1, az2, hhx, hhy, hhz)
-
-    if b_hit:
-        origin_inside = b_entry < 1e-6
-
-        if origin_inside:
-            pc_hit, pc_t, nx, ny, nz = _ray_rectangle_intersect(ox, oy, oz, dx, dy, dz, pcx, pcy, pcz, pcnx, pcny, pcnz, pchalf, up_x, up_y, up_z)
-            if pc_hit and pc_t > 1e-6:
-                best_hit = {"type": "photocathode", "x": ox + dx * pc_t, "y": oy + dy * pc_t, "z": oz + dz * pc_t, "nx": float(nx), "ny": float(ny), "nz": float(nz), "t": float(pc_t)}
-
-        elif b_front and b_entry > 1e-6:
-            pc_hit, pc_t, nx, ny, nz = _ray_rectangle_intersect(ox, oy, oz, dx, dy, dz, pcx, pcy, pcz, pcnx, pcny, pcnz, pchalf, up_x, up_y, up_z)
-            if pc_hit and pc_t > 1e-6 and pc_t <= b_exit + 1e-6:
-                best_hit = {"type": "photocathode", "x": ox + dx * pc_t, "y": oy + dy * pc_t, "z": oz + dz * pc_t, "nx": float(nx), "ny": float(ny), "nz": float(nz), "t": float(pc_t)}
-            else:
-                best_hit = {"type": "housing", "x": ox + dx * b_entry, "y": oy + dy * b_entry, "z": oz + dz * b_entry, "nx": float(az0), "ny": float(az1), "nz": float(az2), "t": float(b_entry)}
-
-        else:
-            best_hit = {"type": "housing", "x": ox + dx * b_entry, "y": oy + dy * b_entry, "z": oz + dz * b_entry, "nx": float(az0), "ny": float(az1), "nz": float(az2), "t": float(b_entry)}
-
+    origins = np.array([[ox, oy, oz]], dtype=np.float32)
+    directions = np.array([[dx, dy, dz]], dtype=np.float32)
+    hits_array = trace_rays(origins, directions, _geometry)
+    if hits_array[0, HI] < 0.5:
+        return None
+    cid = int(hits_array[0, HCID])
+    if cid == CID_LAPPD:
+        htype = "photocathode"
+    elif cid == CID_INNER_STRUCTURE:
+        htype = "housing"
     else:
-        pc_hit, pc_t, nx, ny, nz = _ray_rectangle_intersect(ox, oy, oz, dx, dy, dz, pcx, pcy, pcz, pcnx, pcny, pcnz, pchalf, up_x, up_y, up_z)
-        if pc_hit and pc_t > 1e-6:
-            best_hit = {"type": "photocathode", "x": ox + dx * pc_t, "y": oy + dy * pc_t, "z": oz + dz * pc_t, "nx": float(nx), "ny": float(ny), "nz": float(nz), "t": float(pc_t)}
-
-    return best_hit
+        return None
+    return _sanitise({
+        "type": htype,
+        "x": float(hits_array[0, HX]),
+        "y": float(hits_array[0, HY]),
+        "z": float(hits_array[0, HZ]),
+        "nx": float(hits_array[0, HNX]),
+        "ny": float(hits_array[0, HNY]),
+        "nz": float(hits_array[0, HNZ]),
+    })
 
 
 def _sanitise(obj):
@@ -1155,7 +1014,7 @@ class LAPPDServer(BaseHTTPRequestHandler):
             self._send_json({"error": "invalid parameters"}, 400)
             return
 
-        hit = _trace_single_ray(ox, oy, oz, dx, dy, dz, self._housing)
+        hit = _trace_single_ray(ox, oy, oz, dx, dy, dz)
         if hit is None:
             self._send_json({"hit": False})
         else:
@@ -1163,8 +1022,9 @@ class LAPPDServer(BaseHTTPRequestHandler):
 
 
 def run_server(host: str = "localhost", port: int = 8081) -> None:
-    global housing_json
+    global housing_json, _geometry
     housing_json = _build_housing_json()
+    _geometry = build_single_lappd_geometry((0, 0, 0), (0, 0, 1))
     LAPPDServer._housing = housing_json
     server = HTTPServer((host, port), LAPPDServer)
     print(f"LAPPD Cherenkov viewer at http://{host}:{port}/")
