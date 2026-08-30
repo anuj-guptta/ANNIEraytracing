@@ -1098,7 +1098,7 @@ async function doTrace() {
         const CKV = 0x44ddff, SCI = 0xffdd44;
         function mkMat(color, opacity) {
             return new THREE.MeshBasicMaterial({
-                color, transparent: true, opacity, depthWrite: false
+                color, transparent: true, opacity, depthWrite: false, depthTest: false
             });
         }
         const ckvPmtMat = mkMat(CKV, 1.0);
