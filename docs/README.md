@@ -441,6 +441,18 @@ analysis without re-tracing. In the viz-server, the two sources are drawn
 in distinct colours (cyan = Cherenkov, yellow = scintillation) and can be
 shown/hidden independently.
 
+### Viewer rendering semantics
+
+Hit markers in the viewer obey physical occlusion: they render on top of
+the surface they sit on, but are hidden when a solid surface lies between
+them and the camera. The surfboard obscurant panels are drawn **opaque**
+(matching the real PVC), so hits placed behind a board are properly
+obscured by it from the appropriate viewing angles. Markers use
+`depthTest: true` with a high `renderOrder`, and the surfaces they land on
+(the photocathode planes, structure mesh, boards, PMT inner layers) carry a
+small `polygonOffset` so a marker sitting on a face is never z-fought away
+by its own surface.
+
 ## Multi-bounce optics & water attenuation
 
 With `--max-bounces N` (N > 0), `trace_with_optics()` manages N rounds
