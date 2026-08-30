@@ -71,10 +71,23 @@ python -m annieray batch --no-pmt-holders \
     --surfboard 3 \
     --events 100
 
+# Batch simulation with Cherenkov + wbLS scintillation
+python -m annieray batch \
+    --pmt-csv PMTPositions_Scan.txt \
+    --surfboard 3 \
+    --events 100 --photons-per-cm 150 \
+    --scintillation --photons-per-cm-scint 100
+
+# Scintillation-only batch (Cherenkov off)
+python -m annieray batch \
+    --pmt-csv PMTPositions_Scan.txt \
+    --events 100 --photons-per-cm 0 \
+    --scintillation --photons-per-cm-scint 100
+
 # Direction fit
 python -m annieray fit output.h5 --event 0 --show
 
-# 3D viewer
+# 3D viewer (scintillation toggle + parameters in the Trace panel)
 python -m annieray viz-server --pmt-csv PMTPositions_Scan.txt --surfboard 3 --port 8080
 ```
 
@@ -86,6 +99,12 @@ python -m annieray viz-server --pmt-csv PMTPositions_Scan.txt --surfboard 3 --po
 | `--no-pmt-holders` | false | Skip PMT body and hardware holder meshes (PMT positions still loaded) |
 | `--no-lappd` | false | Skip LAPPD rectangles |
 | `--surfboard` | 0 | Number of obscurant PVC surfboards (0, 1, or 3) — use 3 for Phase II |
+| `--scintillation` | false | Enable wbLS scintillation photon generation (adds to Cherenkov) |
+| `--photons-per-cm-scint` | 100 | Scintillation photons per cm of track |
+| `--tau-fast` | 2.0 | Fast scintillation decay time (ns) |
+| `--tau-slow` | 20.0 | Slow scintillation decay time (ns) |
+| `--fast-fraction` | 0.95 | Fraction of scintillation light in the fast component |
+| `--wavelength-scint` | 420.0 | Scintillation photon wavelength (nm) |
 
 ## Key Data Files
 
@@ -119,6 +138,9 @@ The core ray tracer is complete and working. All major features implemented:
 - GDML and STEP geometry parsing
 - Taichi GPU ray tracing with BVH acceleration
 - Cherenkov photon generation (vectorized)
+- wbLS scintillation photon generation (isotropic, delayed emission) with
+  per-source tagging (`photon_source`: 0=Cherenkov, 1=scintillation) through
+  the hit array, HDF5 output, and 3D viewer
 - Batch-mode simulation with HDF5 output
 - PMT and LAPPD digital response models
 - Multi-bounce Fresnel optics
@@ -130,9 +152,18 @@ Recent work focuses on validation, analysis scripts, and fitting accuracy.
 ## Testing
 
 ```bash
-pytest                    # Run all tests
-pytest tests/test_tracer.py  # Tracer-specific tests
+pytest                         # Run all fast tests (slow ones deselected)
+pytest -m slow                 # Run slow end-to-end tests (geometry + GPU kernel)
+pytest tests/test_tracer.py    # Tracer-specific tests
+pytest tests/test_timing_e2e.py -m slow  # End-to-end arrival-time sanity test
 ```
+
+Timing tests assert that final `arrival_time = create_time + path/c_in_water`,
+where `create_time` already includes the muon arrival at the emission point
+(Cherenkov) or muon arrival + scintillation decay delay (scintillation).
+
+Note: the generators store the muon start time `t0` in **seconds** (they
+internally convert via `*10**9` to ns), so pass `t0` as seconds, not ns.
 
 ## Git Submodules
 

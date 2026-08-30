@@ -14,10 +14,22 @@ with on-the-fly raytracing per hypothesis.
 ## Quick Start
 
 ```bash
-# Batch-mode simulation
+# Batch-mode simulation (Cherenkov)
 python -m annieray batch \
     --pmt-csv PMTPositions_Scan.txt \
     --events 100 --photons-per-cm 150
+
+# Batch-mode simulation with wbLS scintillation (adds to Cherenkov)
+python -m annieray batch \
+    --pmt-csv PMTPositions_Scan.txt \
+    --events 100 --photons-per-cm 150 \
+    --scintillation --photons-per-cm-scint 100
+
+# Scintillation-only batch (Cherenkov off)
+python -m annieray batch \
+    --pmt-csv PMTPositions_Scan.txt \
+    --events 100 --photons-per-cm 0 \
+    --scintillation --photons-per-cm-scint 100
 
 # Direction fit for a single event (grid scan, runs raytracing per hypothesis)
 python -m annieray fit output.h5 --event 0 --show
@@ -26,7 +38,7 @@ python -m annieray fit output.h5 --event 0 --show
 python -m annieray fit output.h5 --event 0 \
     --theta-window 10 --grid-steps 21 --show
 
-# Interactive 3D viewer
+# Interactive 3D viewer (scintillation toggle + parameters in Trace panel)
 python -m annieray viz-server \
     --pmt-csv PMTPositions_Scan.txt --port 8080
 ```
@@ -70,6 +82,12 @@ python -m annieray batch [flags]
 | `--output-dir` | `results/` | Output directory for HDF5 file |
 | `--no-record` | false | Skip writing per-event output |
 | `--wavelength` | 350.0 | Cherenkov photon wavelength (nm) |
+| `--scintillation` | false | Enable wbLS scintillation photon generation (adds to Cherenkov) |
+| `--photons-per-cm-scint` | 100 | Scintillation photons per cm of track |
+| `--wavelength-scint` | 420.0 | Scintillation photon wavelength (nm) |
+| `--tau-fast` | 2.0 | Fast scintillation decay time (ns) |
+| `--tau-slow` | 20.0 | Slow scintillation decay time (ns) |
+| `--fast-fraction` | 0.95 | Fraction of scintillation light in the fast component |
 | `--optics-config` | None | YAML file with per-material optical properties |
 | `--water-absorption-mm` | 0.0 | Water absorption length in mm (0 = off) |
 | `--water-scattering-mm` | 0.0 | Rayleigh scattering length in mm (0 = off) |
@@ -79,11 +97,16 @@ python -m annieray batch [flags]
 
 | Table | Contents |
 |-------|----------|
-| `photon_hits` | Per-photon hit records |
+| `photon_hits` | Per-photon hit records, incl. `photon_source` (0=Cherenkov, 1=scintillation) |
 | `pmt_responses` | Digitised charges and hit times (when `--pmt-response`) |
-| `muon_truth` | Per-event truth (position, direction, track length, etc.) |
+| `muon_truth` | Per-event truth (position, direction, track length, etc.) with per-source generated/detected counts |
 | `detectors` | Detector registry (system, index, position, label, panel) |
 | `metadata` | Tank dimensions and geometry parameters |
+
+The `photon_hits.arrival_time` column already includes the scintillation
+decay delay for scintillation photons, so Cherenkov and scintillation
+timing can be studied separately via `photon_source` without any
+additional book-keeping.
 
 ### `fit` — Direction fitting from batch output
 
@@ -122,6 +145,30 @@ python -m annieray fit output.h5 [--event 0] [flags]
 **Plot type auto-detection:**
 - Full-sky grid (θ span > 170°, φ span > 350°) → polar
 - Zoomed-in grid → rectangular (Δθ × Δφ heatmap)
+
+## Testing
+
+```bash
+pytest                         # All fast tests (slow ones deselected)
+pytest -m slow                 # Slow end-to-end tests (geometry + GPU kernel)
+pytest tests/test_scintillation.py  # Scintillation / timing unit tests
+pytest tests/test_timing_e2e.py -m slow  # End-to-end arrival-time sanity test
+```
+
+The default `pytest` run deselects the `slow` marker (configured via
+`addopts` in `pyproject.toml`); run them explicitly with `-m slow`.
+
+**Timing tests.** The final photon `arrival_time` is always computed as
+`create_time + path_length / c_in_water`, where `create_time` already
+includes the muon's arrival at the emission point (Cherenkov) and, for
+scintillation, an additional sampled decay delay. Tests verify this:
+`tests/test_scintillation.py` checks the created-time offsets directly, and
+`tests/test_timing_e2e.py` traces the same muon twice with identical origins
+but different `tau_fast`, confirming the reported `arrival_time` shifts by
+exactly the decay-constant difference.
+
+> Note: the generators store the muon start time `t0` in **seconds** (they
+> internally convert via `*10**9` to ns), so pass `t0` as seconds, not ns.
 
 ### Gridded likelihood search workflow
 
@@ -315,7 +362,8 @@ score is `LL = LL_charge + α · LL_time`.
                                   |
                     ┌─────────────┴──────────────┐
                     v                             v
-              trace_rays()                 trace_cherenkov()
+              trace_rays()            trace_muon_light()
+                                    (Cherenkov + optional scintillation)
                     |                             |
                     └─────────────┬───────────────┘
                                   v
@@ -369,6 +417,30 @@ The `--lappd-model annie` flag replaces the default bare photocathode
 rectangle with the full Kandemir waterproof housing: a 5-sided acrylic
 box (330 x 430 x 60 mm) with an off-centre photocathode (191.5 x 191.5 mm).
 
+## Scintillation (wbLS)
+
+With `--scintillation`, the batch mode and viz-server additionally emit
+scintillation photons along the muon track. Unlike Cherenkov light
+(a cone around the muon direction), scintillation is emitted
+**isotropically** and its emission time is **delayed** by an exponential
+decay sampled from a mixture of fast and slow components:
+
+- fast decay `--tau-fast` (default 2.0 ns) — ~95% of light (`--fast-fraction`)
+- slow decay `--tau-slow` (default 20.0 ns) — the remainder
+
+These defaults match the companion ANNIE wbLS characterisation
+(Caravaca et al., arXiv:2006.00173). Photons continue to be emitted along
+the track at a rate set by `--photons-per-cm-scint`.
+
+Both photon types are concatenated and traced in a **single GPU call**, and
+tagged per-photon in the expanded hit array column `H_SOURCE`
+(`SOURCE_CKV = 0`, `SOURCE_SCI = 1`). This propagates to the HDF5
+`photon_hits.photon_source` column and the `muon_truth` per-source generated
+and detected counts, so Cherenkov/scintillation hits can be separated in
+analysis without re-tracing. In the viz-server, the two sources are drawn
+in distinct colours (cyan = Cherenkov, yellow = scintillation) and can be
+shown/hidden independently.
+
 ## Multi-bounce optics & water attenuation
 
 With `--max-bounces N` (N > 0), `trace_with_optics()` manages N rounds
@@ -385,9 +457,10 @@ path. Both are off by default (`0.0` = disabled).
 | File | Role |
 |------|------|
 | `cli.py` | CLI parser, all subcommands (`batch`, `fit`, `viz-server`, etc.) |
-| `tracer.py` | Geometry dataclass, `build_geometry()`, Taichi trace kernel, `trace_cherenkov()` |
+| `tracer.py` | Geometry dataclass, `build_geometry()`, Taichi trace kernel, `trace_muon_light()`/`trace_cherenkov()` |
 | `batch.py` | Batch-mode event loop, `BatchAccumulator` for HDF5 output |
 | `cherenkov.py` | Vectorised Cherenkov / isotropic photon generator |
+| `scintillation.py` | Isotropic, delayed wbLS scintillation photon generator |
 | `fitting.py` | `grid_scan_direction()`, `load_observed_event()`, `ScanResult`/`ObservedEvent` |
 | `likelihood.py` | Poisson charge + Gaussian time residual log-likelihood |
 | `io_h5.py` | HDF5 table I/O (load/save/append) |

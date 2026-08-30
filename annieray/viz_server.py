@@ -24,7 +24,8 @@ import numpy as np
 
 from annieray.pmt_loader import rotate_z
 from annieray.pmt_mesh import build_viz_caches
-from annieray.tracer import build_geometry, trace_cherenkov, reload_lappd_corrections
+from annieray.tracer import build_geometry, trace_muon_light, reload_lappd_corrections
+from annieray.tracer import HI, HCID, HX, HZ, H_SOURCE, SOURCE_CKV, SOURCE_SCI
 
 geometry = None
 
@@ -511,6 +512,12 @@ class VizHandler(BaseHTTPRequestHandler):
             dz = float(params.get("dz", ["-1"])[0])
             photons_per_cm = int(params.get("photons_per_cm", ["150"])[0])
             photons_per_cm = min(max(photons_per_cm, 1), 1000)
+            scintillation = params.get("scintillation", ["false"])[0].lower() == "true"
+            photons_per_cm_scint = int(params.get("photons_per_cm_scint", ["100"])[0])
+            photons_per_cm_scint = min(max(photons_per_cm_scint, 1), 1000)
+            tau_fast = float(params.get("tau_fast", ["2.0"])[0])
+            tau_slow = float(params.get("tau_slow", ["20.0"])[0])
+            fast_fraction = float(params.get("fast_fraction", ["0.95"])[0])
         except (ValueError, TypeError):
             self._send_json({"error": "invalid parameters"}, 400)
             return
@@ -518,33 +525,64 @@ class VizHandler(BaseHTTPRequestHandler):
         rng = np.random.default_rng()
         t0 = time.time()
         reload_lappd_corrections(geometry)
-        hits = trace_cherenkov(
+        hits = trace_muon_light(
             (mx, my, mz), (dx, dy, dz), photons_per_cm, geometry, rng=rng,
+            scintillation_enabled=scintillation,
+            photons_per_cm_scint=photons_per_cm_scint,
+            tau_fast=tau_fast, tau_slow=tau_slow, fast_fraction=fast_fraction,
         )
         global _last_trace_hits
         _last_trace_hits = hits
         elapsed = time.time() - t0
 
-        total_hits = int(hits[:, 0].sum())
+        total_hits = int(hits[:, HI].sum())
         total_photons = photons_per_cm * 401
+        if scintillation:
+            total_photons += photons_per_cm_scint * 401
 
-        # Return positions by component type — these are drawn as dots
-        comp = hits[:, 8]
-        pmt_positions    = hits[comp == 2.0, 2:5].tolist()
-        struct_positions = hits[comp == 1.0, 2:5].tolist()
-        lappd_positions  = hits[comp == 3.0, 2:5].tolist()
-        tank_positions   = hits[comp == 4.0, 2:5].tolist()
+        # Return positions by component type and source type.
+        # Coloring happens client-side: base hue = source (cyan=CK V, yellow=SCI),
+        # opacity = hit type (PMT/LAPPD/structure/tank).
+        def _split(src_val):
+            mask = (hits[:, H_SOURCE] == src_val)
+            comp = hits[:, HCID]
+            out = {"pmt": [], "struct": [], "lappd": [], "tank": []}
+            sel_pos = hits[mask, HX:HZ + 1].tolist()
+            sel_comp = comp[mask]
+            for (p, c) in zip(sel_pos, sel_comp):
+                if c == 2.0:
+                    out["pmt"].append(p)
+                elif c == 1.0:
+                    out["struct"].append(p)
+                elif c == 3.0:
+                    out["lappd"].append(p)
+                elif c == 4.0:
+                    out["tank"].append(p)
+            return out
+
+        ckv = _split(SOURCE_CKV)
+        sci = _split(SOURCE_SCI) if scintillation else {
+            "pmt": [], "struct": [], "lappd": [], "tank": []
+        }
 
         self._send_json({
-            "pmt_positions": pmt_positions,
-            "struct_positions": struct_positions,
-            "lappd_positions": lappd_positions,
-            "tank_positions": tank_positions,
+            "ckv_pmt_positions": ckv["pmt"],
+            "ckv_struct_positions": ckv["struct"],
+            "ckv_lappd_positions": ckv["lappd"],
+            "ckv_tank_positions": ckv["tank"],
+            "sci_pmt_positions": sci["pmt"],
+            "sci_struct_positions": sci["struct"],
+            "sci_lappd_positions": sci["lappd"],
+            "sci_tank_positions": sci["tank"],
             "counts": {
-                "pmt": len(pmt_positions),
-                "struct": len(struct_positions),
-                "lappd": len(lappd_positions),
-                "tank": len(tank_positions),
+                "ckv_pmt": len(ckv["pmt"]),
+                "ckv_struct": len(ckv["struct"]),
+                "ckv_lappd": len(ckv["lappd"]),
+                "ckv_tank": len(ckv["tank"]),
+                "sci_pmt": len(sci["pmt"]),
+                "sci_struct": len(sci["struct"]),
+                "sci_lappd": len(sci["lappd"]),
+                "sci_tank": len(sci["tank"]),
             },
             "total_hits": total_hits,
             "total_photons": total_photons,
@@ -705,7 +743,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <label style="margin-top:2px;"><input type="checkbox" id="showScanTips"> Show Scan Tips</label>
   <label style="margin-top:2px;"><input type="checkbox" id="showCone" checked> Show Cone Guide</label>
   <label style="margin-top:2px;"><input type="checkbox" id="showRayLines"> Show Ray Lines</label>
-  <button id="traceBtn" style="margin-top:8px;">Trace Cherenkov Photons</button>
+  <label style="margin-top:2px;"><input type="checkbox" id="showCkv" checked> Show Cherenkov</label>
+  <label style="margin-top:2px;"><input type="checkbox" id="showSci" checked> Show Scintillation</label>
+  <label style="margin-top:2px;"><input type="checkbox" id="scintillationToggle"> Enable Scintillation</label>
+  <label style="margin-top:2px;">Scint ph/cm
+    <input type="number" id="scintPpc" value="100" min="1" max="1000" style="width:64px"></label>
+  <label style="margin-top:2px;">τ<sub>fast</sub> (ns)
+    <input type="number" id="tauFast" value="2.0" step="0.1" min="0.1" style="width:60px"></label>
+  <label style="margin-top:2px;">τ<sub>slow</sub> (ns)
+    <input type="number" id="tauSlow" value="20.0" step="1" min="0.5" style="width:60px"></label>
+  <label style="margin-top:2px;">Fast frac
+    <input type="number" id="fastFraction" value="0.95" step="0.01" min="0" max="1" style="width:60px"></label>
+  <button id="traceBtn" style="margin-top:8px;">Trace Photons</button>
   <div id="traceResult" style="margin-top:6px;font-size:12px;line-height:1.5;"></div>
   <hr style="margin:8px 0;border:none;border-top:1px solid rgba(0,0,0,0.15);">
   <h3 style="margin-top:6px;">View</h3>
@@ -766,6 +815,8 @@ let spotTarget = null;
 let housingData = null;
 let housingMeshes = [];
 let tracePoints = null;   // group of dot meshes for traced photon hits
+let ckvGroup = null;      // subgroup of Cherenkov hit dots inside tracePoints
+let sciGroup = null;      // subgroup of scintillation hit dots inside tracePoints
 let rayLines = null;      // group of line meshes for sampled ray paths
 let refSpheres = null;    // group of translucent reference spheres
 let scanOverlay = null;   // group for scan mesh overlay
@@ -1019,6 +1070,11 @@ async function doTrace() {
     const dy = Math.sin(theta) * Math.sin(phi);
     const dz = Math.cos(theta);
     const photonsPerCm = 150;
+    const sciOn = document.getElementById('scintillationToggle').checked;
+    const sciPpc = document.getElementById('scintPpc').value;
+    const tauFast = document.getElementById('tauFast').value;
+    const tauSlow = document.getElementById('tauSlow').value;
+    const fastFrac = document.getElementById('fastFraction').value;
 
     const btn = document.getElementById('traceBtn');
     btn.disabled = true;
@@ -1026,40 +1082,56 @@ async function doTrace() {
     traceResultEl = document.getElementById('traceResult');
 
     try {
-        const url = `/api/trace?mx=${mx}&my=${my}&mz=${mz}&dx=${dx.toFixed(6)}&dy=${dy.toFixed(6)}&dz=${dz.toFixed(6)}&photons_per_cm=${photonsPerCm}`;
+        let url = `/api/trace?mx=${mx}&my=${my}&mz=${mz}&dx=${dx.toFixed(6)}&dy=${dy.toFixed(6)}&dz=${dz.toFixed(6)}&photons_per_cm=${photonsPerCm}`
+            + `&scintillation=${sciOn}&photons_per_cm_scint=${sciPpc}`
+            + `&tau_fast=${tauFast}&tau_slow=${tauSlow}&fast_fraction=${fastFrac}`;
         const resp = await fetch(url);
         const data = await resp.json();
 
         // Remove previous trace dots
         if (tracePoints) scene.remove(tracePoints);
 
+        // Option A colour scheme:
+        //   base hue = source   (cyan 0x44ddff = Cherenkov, yellow 0xffdd44 = scintillation)
+        //   opacity  = hit type (PMT 1.0, LAPPD 0.8, structure 0.4, tank 0.2)
         const dotGeo = new THREE.SphereGeometry(8, 6, 6);
-        const pmtMat = new THREE.MeshBasicMaterial({ color: 0x44dd88 });
-        const structMat = new THREE.MeshBasicMaterial({ color: 0xff8844 });
-        const lappdMat = new THREE.MeshBasicMaterial({ color: 0xdd44dd });
-        const tankMat = new THREE.MeshBasicMaterial({ color: 0x4488ff });
+        const CKV = 0x44ddff, SCI = 0xffdd44;
+        function mkMat(color, opacity) {
+            return new THREE.MeshBasicMaterial({
+                color, transparent: true, opacity, depthWrite: false
+            });
+        }
+        const ckvPmtMat = mkMat(CKV, 1.0);
+        const ckvLappdMat = mkMat(CKV, 0.8);
+        const ckvStructMat = mkMat(CKV, 0.4);
+        const ckvTankMat = mkMat(CKV, 0.2);
+        const sciPmtMat = mkMat(SCI, 1.0);
+        const sciLappdMat = mkMat(SCI, 0.8);
+        const sciStructMat = mkMat(SCI, 0.4);
+        const sciTankMat = mkMat(SCI, 0.2);
 
         tracePoints = new THREE.Group();
-        for (const p of data.pmt_positions) {
-            const m = new THREE.Mesh(dotGeo, pmtMat);
-            m.position.set(p[0], p[1], p[2]);
-            tracePoints.add(m);
+        ckvGroup = new THREE.Group();
+        sciGroup = new THREE.Group();
+        function addDots(group, key, mat) {
+            for (const p of data[key] || []) {
+                const m = new THREE.Mesh(dotGeo, mat);
+                m.position.set(p[0], p[1], p[2]);
+                group.add(m);
+            }
         }
-        for (const p of data.struct_positions) {
-            const m = new THREE.Mesh(dotGeo, structMat);
-            m.position.set(p[0], p[1], p[2]);
-            tracePoints.add(m);
-        }
-        for (const p of data.lappd_positions) {
-            const m = new THREE.Mesh(dotGeo, lappdMat);
-            m.position.set(p[0], p[1], p[2]);
-            tracePoints.add(m);
-        }
-        for (const p of data.tank_positions) {
-            const m = new THREE.Mesh(dotGeo, tankMat);
-            m.position.set(p[0], p[1], p[2]);
-            tracePoints.add(m);
-        }
+        addDots(ckvGroup, 'ckv_pmt_positions', ckvPmtMat);
+        addDots(ckvGroup, 'ckv_struct_positions', ckvStructMat);
+        addDots(ckvGroup, 'ckv_lappd_positions', ckvLappdMat);
+        addDots(ckvGroup, 'ckv_tank_positions', ckvTankMat);
+        addDots(sciGroup, 'sci_pmt_positions', sciPmtMat);
+        addDots(sciGroup, 'sci_struct_positions', sciStructMat);
+        addDots(sciGroup, 'sci_lappd_positions', sciLappdMat);
+        addDots(sciGroup, 'sci_tank_positions', sciTankMat);
+        ckvGroup.visible = document.getElementById('showCkv').checked;
+        sciGroup.visible = document.getElementById('showSci').checked;
+        tracePoints.add(ckvGroup);
+        tracePoints.add(sciGroup);
         scene.add(tracePoints);
 
         // Ray lines: sample up to 500 lines from muon vertex to hit positions
@@ -1071,12 +1143,19 @@ async function doTrace() {
                 parseFloat(document.getElementById('my').value),
                 parseFloat(document.getElementById('mz').value),
             );
-            // Collect all hit positions
+            // Collect all hit positions (colour = source, opacity fixed 0.25)
             const allHits = [];
-            for (const p of data.pmt_positions) allHits.push({ pos: p, color: 0x44dd88 });
-            for (const p of data.struct_positions) allHits.push({ pos: p, color: 0xff8844 });
-            for (const p of data.lappd_positions) allHits.push({ pos: p, color: 0xdd44dd });
-            for (const p of data.tank_positions) allHits.push({ pos: p, color: 0x4488ff });
+            function addLines(key, color) {
+                for (const p of data[key] || []) allHits.push({ pos: p, color: color });
+            }
+            addLines('ckv_pmt_positions', CKV);
+            addLines('ckv_struct_positions', CKV);
+            addLines('ckv_lappd_positions', CKV);
+            addLines('ckv_tank_positions', CKV);
+            addLines('sci_pmt_positions', SCI);
+            addLines('sci_struct_positions', SCI);
+            addLines('sci_lappd_positions', SCI);
+            addLines('sci_tank_positions', SCI);
             // Sample
             const maxLines = 500;
             const step = Math.max(1, Math.floor(allHits.length / maxLines));
@@ -1099,25 +1178,34 @@ async function doTrace() {
         }
 
         const c = data.counts;
-        traceResultEl.innerHTML = `<b>${data.total_hits}</b>/<b>${data.total_photons}</b> hits `
-            + `(PMT <b>${c.pmt}</b>, `
-            + `struct <b>${c.struct}</b>, `
-            + `LAPPD <b>${c.lappd}</b>, `
-            + `tank <b>${c.tank}</b>) `
+        const ckvTotal = c.ckv_pmt + c.ckv_struct + c.ckv_lappd + c.ckv_tank;
+        const sciTotal = c.sci_pmt + c.sci_struct + c.sci_lappd + c.sci_tank;
+        let ckvTxt = `<span style="color:#44ddff">Cherenkov <b>${ckvTotal}</b></span>`;
+        let sciTxt = sciOn
+            ? `, <span style="color:#ffdd44">scintillation <b>${sciTotal}</b></span>`
+            : '';
+        traceResultEl.innerHTML = `<b>${data.total_hits}</b>/<b>${data.total_photons}</b> hits (`
+            + ckvTxt
+            + sciTxt
+            + `) (PMT <b>${c.ckv_pmt + c.sci_pmt}</b>, `
+            + `LAPPD <b>${c.ckv_lappd + c.sci_lappd}</b>, `
+            + `struct <b>${c.ckv_struct + c.sci_struct}</b>, `
+            + `tank <b>${c.ckv_tank + c.sci_tank}</b>) `
             + `<span style="color:#888">· ${photonsPerCm} ph/cm</span> `
             + `in ${data.time_ms} ms`;
 
         // Enable LAPPD readout button if there are LAPPD hits
         const roBtn = document.getElementById('showLappdReadout');
-        roBtn.disabled = (c.lappd === 0);
-        if (c.lappd > 0) {
+        const lappdTotal = c.ckv_lappd + c.sci_lappd;
+        roBtn.disabled = (lappdTotal === 0);
+        if (lappdTotal > 0) {
             roBtn.dataset.hasLappdHits = 'true';
         }
     } catch (e) {
         traceResultEl.textContent = 'Trace failed: ' + e.message;
     } finally {
         btn.disabled = false;
-        btn.textContent = 'Trace Cherenkov Photons';
+        btn.textContent = 'Trace Photons';
     }
 }
 
@@ -1245,6 +1333,12 @@ document.getElementById('showCone').addEventListener('change', () => {
 });
 document.getElementById('showRayLines').addEventListener('change', () => {
     if (rayLines) rayLines.visible = document.getElementById('showRayLines').checked;
+});
+document.getElementById('showCkv').addEventListener('change', () => {
+    if (ckvGroup) ckvGroup.visible = document.getElementById('showCkv').checked;
+});
+document.getElementById('showSci').addEventListener('change', () => {
+    if (sciGroup) sciGroup.visible = document.getElementById('showSci').checked;
 });
 document.getElementById('traceBtn').addEventListener('click', doTrace);
 

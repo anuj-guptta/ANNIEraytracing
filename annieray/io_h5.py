@@ -12,7 +12,7 @@ import pandas as pd
 # Numpy structured dtypes  (field names → DataFrame column names)
 # ---------------------------------------------------------------------------
 
-# Batch photon hits (7 columns)
+# Batch photon hits (8 columns)
 PHOTON_HIT_DTYPE = np.dtype([
     ("event_id", "i8"),
     ("detector_system", "i4"),
@@ -21,9 +21,10 @@ PHOTON_HIT_DTYPE = np.dtype([
     ("local_v", "f4"),
     ("arrival_time", "f4"),
     ("wavelength", "f4"),
+    ("photon_source", "i4"),
 ])
 
-# Muon truth (13 columns)
+# Muon truth (17 columns)
 MUON_TRUTH_DTYPE = np.dtype([
     ("event_id", "i8"),
     ("pos_x", "f4"),
@@ -38,6 +39,10 @@ MUON_TRUTH_DTYPE = np.dtype([
     ("track_length_mm", "f4"),
     ("n_generated", "i4"),
     ("n_detected", "i4"),
+    ("n_generated_ckv", "i4"),
+    ("n_generated_sci", "i4"),
+    ("n_detected_ckv", "i4"),
+    ("n_detected_sci", "i4"),
 ])
 
 # PMT responses (5 columns)
@@ -60,7 +65,7 @@ DETECTOR_DTYPE = np.dtype([
     ("panel", "i4"),
 ])
 
-# Full hit table for single-shot mode (17 columns)
+# Full hit table for single-shot mode (18 columns)
 FULL_HIT_DTYPE = np.dtype([
     ("hit_flag", "i4"),
     ("t", "f4"),
@@ -78,6 +83,7 @@ FULL_HIT_DTYPE = np.dtype([
     ("arrival_time", "f4"),
     ("wavelength", "f4"),
     ("bounce_count", "i4"),
+    ("photon_source", "i4"),
     ("photon_id", "i8"),
 ])
 
@@ -201,7 +207,7 @@ def write_full_hits(path: Path, hits: np.ndarray,
     from annieray.tracer import (
         HI, HT, HX, HY, HZ, HNX, HNY, HNZ,
         HCID, HDI, HDS, HLU, HLV, HMAT,
-        N_HIT_COLS, H_ARRIVAL, H_WAVELEN, H_BOUNCE, N_EXPANDED_COLS,
+        N_HIT_COLS, H_ARRIVAL, H_WAVELEN, H_BOUNCE, H_SOURCE, N_EXPANDED_COLS,
     )
 
     n = hits.shape[0]
@@ -213,6 +219,7 @@ def write_full_hits(path: Path, hits: np.ndarray,
         full = np.full((n, N_EXPANDED_COLS), np.nan, dtype=np.float32)
         full[:, :N_HIT_COLS] = hits
         full[:, H_BOUNCE] = 0
+        full[:, H_SOURCE] = 0
     else:
         full = hits
 
@@ -233,6 +240,7 @@ def write_full_hits(path: Path, hits: np.ndarray,
     arr["arrival_time"] = full[:, H_ARRIVAL].astype(np.float32)
     arr["wavelength"] = full[:, H_WAVELEN].astype(np.float32)
     arr["bounce_count"] = full[:, H_BOUNCE].astype(np.int32)
+    arr["photon_source"] = full[:, H_SOURCE].astype(np.int32)
     arr["photon_id"] = photon_ids
 
     with h5py.File(path, "w") as f:

@@ -163,6 +163,18 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Comma-separated LAPPD candidate indices")
     batch.add_argument("--wavelength", type=float, default=350.0,
                        help="Photon wavelength in nm (default: 350)")
+    batch.add_argument("--scintillation", action="store_true",
+                       help="Enable scintillation photon generation (wbLS)")
+    batch.add_argument("--photons-per-cm-scint", type=int, default=100,
+                       help="Scintillation photons per cm of track (default: 100)")
+    batch.add_argument("--wavelength-scint", type=float, default=420.0,
+                       help="Scintillation photon wavelength in nm (default: 420)")
+    batch.add_argument("--tau-fast", type=float, default=2.0,
+                       help="Fast scintillation decay time in ns (default: 2.0)")
+    batch.add_argument("--tau-slow", type=float, default=20.0,
+                       help="Slow scintillation decay time in ns (default: 20.0)")
+    batch.add_argument("--fast-fraction", type=float, default=0.95,
+                       help="Fraction of scintillation light in the fast component (default: 0.95)")
     batch.add_argument("--max-bounces", type=int, default=0,
                         help="Number of surface reflections per photon (0 = off)")
     batch.add_argument("--optics-config", type=Path, default=None,
@@ -481,6 +493,12 @@ def batch_command(args: argparse.Namespace) -> None:
         wavelength_nm=args.wavelength,
         max_bounces=args.max_bounces,
         batch_size=args.batch_size,
+        scintillation_enabled=args.scintillation,
+        photons_per_cm_scint=args.photons_per_cm_scint,
+        wavelength_scint_nm=args.wavelength_scint,
+        tau_fast=args.tau_fast,
+        tau_slow=args.tau_slow,
+        fast_fraction=args.fast_fraction,
         pmt_response=args.pmt_response,
         pmt_full_wf=args.full_wf,
         lappd_response=args.lappd_response,

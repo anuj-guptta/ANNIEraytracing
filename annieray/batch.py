@@ -22,11 +22,12 @@ from annieray.io_h5 import (
     append_table,
 )
 from annieray.tracer import (
-    HI, HT, HDI, HDS, HLU, HLV, H_ARRIVAL, H_WAVELEN, H_BOUNCE,
+    HI, HT, HDI, HDS, HLU, HLV, H_ARRIVAL, H_WAVELEN, H_BOUNCE, H_SOURCE,
     DET_SYS_PMT, DET_SYS_LAPPD_ANNIE, DET_SYS_NONE,
     N_HIT_COLS, N_EXPANDED_COLS,
     C_MM_NS, N_WATER_DEFAULT,
-    trace_rays, trace_cherenkov, compute_track_length, Geometry,
+    SOURCE_CKV, SOURCE_SCI,
+    trace_rays, trace_cherenkov, trace_muon_light, compute_track_length, Geometry,
 )
 from annieray.optics import WaterAttenuation
 
@@ -219,6 +220,7 @@ class BatchAccumulator:
         arr["local_v"] = sel[:, HLV]
         arr["arrival_time"] = sel[:, H_ARRIVAL]
         arr["wavelength"] = sel[:, H_WAVELEN]
+        arr["photon_source"] = sel[:, H_SOURCE].astype(np.int32)
 
         f = self._ensure_file()
         append_table(f, "photon_hits", arr)
@@ -253,6 +255,10 @@ class BatchAccumulator:
         direc: tuple,
         track_length: float,
         n_generated: int,
+        n_generated_ckv: int = 0,
+        n_generated_sci: int = 0,
+        n_detected_ckv: int = 0,
+        n_detected_sci: int = 0,
     ) -> None:
         """Record one muon truth row."""
         x, y, z, t0 = pos
@@ -278,6 +284,10 @@ class BatchAccumulator:
         arr["track_length_mm"] = track_length * 1000.0  # convert m → mm
         arr["n_generated"] = n_generated
         arr["n_detected"] = n_detected
+        arr["n_generated_ckv"] = n_generated_ckv
+        arr["n_generated_sci"] = n_generated_sci
+        arr["n_detected_ckv"] = n_detected_ckv
+        arr["n_detected_sci"] = n_detected_sci
 
         f = self._ensure_file()
         append_table(f, "muon_truth", arr)
@@ -340,6 +350,14 @@ class BatchConfig:
     max_bounces: int = 0
     batch_size: int = 50
 
+    # Scintillation generation
+    scintillation_enabled: bool = False
+    photons_per_cm_scint: int = 100
+    wavelength_scint_nm: float = 420.0
+    tau_fast: float = 2.0
+    tau_slow: float = 20.0
+    fast_fraction: float = 0.95
+
     # Light burst (replaces Cherenkov generation)
     light_burst: bool = False
     burst_n_photons: int = 1000
@@ -390,6 +408,7 @@ def run_batch(
         were actually written.
     """
     from annieray.cherenkov import generate_cherenkov_photons, generate_isotropic_photons
+    from annieray.scintillation import generate_scintillation_photons
     from annieray.pmt_response import process_pmt_hits
 
     rng = np.random.default_rng(config.seed)
@@ -402,6 +421,7 @@ def run_batch(
     n_water = N_WATER_DEFAULT
     c_in_water = C_MM_NS / n_water
     wave_nm = float(config.wavelength_nm)
+    wave_sci_nm = float(config.wavelength_scint_nm)
 
     t_start = time.time()
     processed = 0
@@ -414,10 +434,13 @@ def run_batch(
         batch_origins: list[np.ndarray] = []
         batch_dirs: list[np.ndarray] = []
         batch_ctimes: list[np.ndarray] = []
+        batch_sources: list[np.ndarray] = []
         event_counts: list[int] = []
         event_muon: list[tuple] = []
         event_track_length: list[float] = []
         event_n_generated: list[int] = []
+        event_n_ckv: list[int] = []
+        event_n_sci: list[int] = []
 
         for i in range(n_batch):
             event_id = processed + i
@@ -431,24 +454,49 @@ def run_batch(
                 o, d, ct = generate_isotropic_photons(
                     muon_pos, config.burst_n_photons, rng,
                 )
+                event_src_ckv = len(o)
+                event_src_sci = 0
             else:
                 track_length = compute_track_length(muon_pos, muon_dir, geometry)
                 o, d, ct = generate_cherenkov_photons(
                     muon_pos, muon_dir, config.photons_per_cm,
                     track_length=track_length, rng=rng,
                 )
+                event_src_ckv = len(o)
+                if config.scintillation_enabled:
+                    sci_o, sci_d, sci_ct = generate_scintillation_photons(
+                        muon_pos, muon_dir, config.photons_per_cm_scint,
+                        track_length=track_length, rng=rng,
+                        tau_fast=config.tau_fast, tau_slow=config.tau_slow,
+                        fast_fraction=config.fast_fraction,
+                        wavelength=wave_sci_nm,
+                    )
+                    event_src_sci = len(sci_o)
+                    o = np.vstack([o, sci_o])
+                    d = np.vstack([d, sci_d])
+                    ct = np.concatenate([ct, sci_ct])
+                else:
+                    event_src_sci = 0
+
             batch_origins.append(o)
             batch_dirs.append(d)
             batch_ctimes.append(ct)
+            batch_sources.append(np.concatenate([
+                np.full(event_src_ckv, SOURCE_CKV, dtype=np.float32),
+                np.full(event_src_sci, SOURCE_SCI, dtype=np.float32),
+            ]))
             event_counts.append(len(o))
             event_muon.append((muon_pos, muon_dir))
             event_track_length.append(track_length)
             event_n_generated.append(len(o))
+            event_n_ckv.append(event_src_ckv)
+            event_n_sci.append(event_src_sci)
 
         # Concatenate into one big array
         all_origins = np.vstack(batch_origins)
         all_dirs = np.vstack(batch_dirs)
         all_ctimes = np.concatenate(batch_ctimes)
+        all_sources = np.concatenate(batch_sources)
 
         # --- One GPU launch for the whole batch ---
         water_cfg = WaterAttenuation(
@@ -473,8 +521,13 @@ def run_batch(
         n_total = hits.shape[0]
         full = np.zeros((n_total, N_EXPANDED_COLS), dtype=np.float32)
         full[:, :N_HIT_COLS] = hits
-        full[:, H_WAVELEN] = wave_nm
         full[:, H_BOUNCE] = bounce_counts
+
+        # Assign per-source wavelength across the combined origin array, then
+        # map back to the detected origins via orig_indices.
+        wav = np.where(all_sources == SOURCE_SCI, wave_sci_nm, wave_nm).astype(np.float32)
+        full[:, H_WAVELEN] = wav[orig_indices]
+        full[:, H_SOURCE] = all_sources[orig_indices]
 
         hit_mask = hits[:, HI] > 0.5
         if hit_mask.any():
@@ -508,11 +561,24 @@ def run_batch(
                 )
 
             if config.record_events:
+                # Per-source detected counts from this event's detector hits
+                # (same mask used by BatchAccumulator._append_photon_hits).
+                det_mask = (
+                    (np.abs(event_hits[:, HDS] - DET_SYS_PMT) < 0.5)
+                    | (np.abs(event_hits[:, HDS] - DET_SYS_LAPPD_ANNIE) < 0.5)
+                )
+                det_sources = event_hits[det_mask, H_SOURCE]
+                n_ckv_det = int(np.sum(det_sources == SOURCE_CKV))
+                n_sci_det = int(np.sum(det_sources == SOURCE_SCI))
                 muon_params = {
                     "pos": muon_pos,
                     "direc": muon_dir,
                     "track_length": event_track_length[i],
                     "n_generated": event_n_generated[i],
+                    "n_generated_ckv": event_n_ckv[i],
+                    "n_generated_sci": event_n_sci[i],
+                    "n_detected_ckv": n_ckv_det,
+                    "n_detected_sci": n_sci_det,
                 }
                 accumulator.append_event(
                     event_id, event_hits, pmt_responses,

@@ -472,9 +472,9 @@ def process_hits(
 
     Parameters
     ----------
-    hits : ndarray, shape (N, 17), float32
-        Output of ``trace_cherenkov()``.  Only rows where
-        ``detector_system == 2`` (DET_SYS_LAPPD_ANNIE) are processed.
+    hits : ndarray, shape (N, N_EXPANDED_COLS), float32
+        Output of ``trace_cherenkov()`` / ``trace_muon_light()``.  Only rows
+        where ``detector_system == 2`` (DET_SYS_LAPPD_ANNIE) are processed.
     config : LAPPDResponseConfig or None
         Pipeline configuration.  Uses defaults when ``None``.
     rng_seed : int
@@ -756,17 +756,19 @@ def process_hit_dicts(
         hit_time[i] = h.get("arrival_time", defaults["arrival_time"])
         wavelength[i] = h.get("wavelength", defaults["wavelength"])
 
+    from annieray.tracer import N_EXPANDED_COLS, HDI, HDS, HLU, HLV, H_ARRIVAL, H_WAVELEN
+
     # Build a synthetic tracer-style hit array.
     # Store PC-centred local coordinates (same convention as the tracer's
     # _lappd_local_coords), so process_hits applies the correct strip-local
     # shift: parallel_pos = HLU + strip_length/2, perp_pos = HLV + pc_half.
-    syn = np.zeros((n, 17), dtype=np.float32)
-    syn[:, 9] = float(detector_index)  # HDI
-    syn[:, 10] = 2.0  # HDS = DET_SYS_LAPPD_ANNIE
-    syn[:, 11] = lv_arr  # HLU = PC-centred, along strips
-    syn[:, 12] = lu_arr  # HLV = PC-centred, across strips
-    syn[:, 14] = hit_time  # H_ARRIVAL
-    syn[:, 15] = wavelength  # H_WAVELEN
+    syn = np.zeros((n, N_EXPANDED_COLS), dtype=np.float32)
+    syn[:, HDI] = float(detector_index)
+    syn[:, HDS] = 2.0  # DET_SYS_LAPPD_ANNIE
+    syn[:, HLU] = lv_arr  # PC-centred, along strips
+    syn[:, HLV] = lu_arr  # PC-centred, across strips
+    syn[:, H_ARRIVAL] = hit_time
+    syn[:, H_WAVELEN] = wavelength
 
     return process_hits(
         syn,

@@ -21,3 +21,9 @@ annieray = "annieray.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["annieray*"]
+
+[tool.pytest.ini_options]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: end-to-end tests that build detector geometry and run the GPU kernel",
+]
