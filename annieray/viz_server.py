@@ -1098,7 +1098,8 @@ async function doTrace() {
         const CKV = 0x44ddff, SCI = 0xffdd44;
         function mkMat(color, opacity) {
             return new THREE.MeshBasicMaterial({
-                color, transparent: true, opacity, depthWrite: false, depthTest: false
+                color, transparent: true, opacity,
+                depthWrite: false, depthTest: true
             });
         }
         const ckvPmtMat = mkMat(CKV, 1.0);
@@ -1117,6 +1118,7 @@ async function doTrace() {
             for (const p of data[key] || []) {
                 const m = new THREE.Mesh(dotGeo, mat);
                 m.position.set(p[0], p[1], p[2]);
+                m.renderOrder = 100;  // draw last among transparents
                 group.add(m);
             }
         }
@@ -1372,6 +1374,9 @@ async function init() {
             transparent: true,
             opacity: 1.0,
             side: THREE.DoubleSide,
+            polygonOffset: true,
+            polygonOffsetFactor: 1.0,
+            polygonOffsetUnits: 4.0,
         });
         const mesh = new THREE.Mesh(flatGeo, meshMat);
         mesh.castShadow = true;
@@ -1481,6 +1486,9 @@ async function init() {
                 opacity: 0.35,   // thin-film PC — subtle tint through glass
                 side: THREE.DoubleSide,
                 depthWrite: true,
+                polygonOffset: true,
+                polygonOffsetFactor: 1.0,
+                polygonOffsetUnits: 4.0,
             });
         }
         function makePvcMat() {
@@ -1490,6 +1498,9 @@ async function init() {
                 metalness: 0.0,
                 side: THREE.DoubleSide,
                 depthWrite: true,
+                polygonOffset: true,
+                polygonOffsetFactor: 1.0,
+                polygonOffsetUnits: 4.0,
             });
         }
 
@@ -1564,6 +1575,9 @@ async function init() {
                         transparent: true,
                         opacity: 0.7,
                         side: THREE.DoubleSide,
+                        polygonOffset: true,
+                        polygonOffsetFactor: 1.0,
+                        polygonOffsetUnits: 4.0,
                     });
                     const hwMesh = new THREE.Mesh(hwGeo, hwMat);
                     hwMesh.position.set(ip[0], ip[1], ip[2]);
@@ -1714,12 +1728,16 @@ async function init() {
                 roughness: 0.6,
                 metalness: 0.0,
                 side: THREE.DoubleSide,
+                depthWrite: false,  // never occlude hit markers on the pc plane
             });
             const pcMat = new THREE.MeshStandardMaterial({
                 color: 0x88bbdd,
                 roughness: 0.3,
                 metalness: 0.1,
                 side: THREE.DoubleSide,
+                polygonOffset: true,
+                polygonOffsetFactor: 1.0,
+                polygonOffsetUnits: 4.0,
             });
             let hidx = 0;
             for (const h of housingData.housing) {
@@ -1849,8 +1867,9 @@ async function init() {
                 roughness: 0.8,
                 metalness: 0.0,
                 side: THREE.DoubleSide,
-                transparent: true,
-                opacity: 0.35,
+                polygonOffset: true,
+                polygonOffsetFactor: 1.0,
+                polygonOffsetUnits: 4.0,
             });
             let sbIdx = 0;
             for (const sb of surfData.surfboards) {
