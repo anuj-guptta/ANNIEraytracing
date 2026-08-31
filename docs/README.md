@@ -437,7 +437,14 @@ tagged per-photon in the expanded hit array column `H_SOURCE`
 (`SOURCE_CKV = 0`, `SOURCE_SCI = 1`). This propagates to the HDF5
 `photon_hits.photon_source` column and the `muon_truth` per-source generated
 and detected counts, so Cherenkov/scintillation hits can be separated in
-analysis without re-tracing. In the viz-server, the two sources are drawn
+analysis without re-tracing. The LAPPD response pipeline (`process_hits`)
+processes both photon types — it filters only on `detector_system`, not on
+`H_SOURCE`, so scintillation photons are digitised alongside Cherenkov
+photons with their own wavelength (420 nm default) and decay-delayed arrival
+time.  The combined counts appear in the readout's `n_photons` /
+`n_passed_qe` but are not split per-source.
+
+In the viz-server, the two sources are drawn
 in distinct colours (cyan = Cherenkov, yellow = scintillation) and can be
 shown/hidden independently.
 
